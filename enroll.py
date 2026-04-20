@@ -23,9 +23,35 @@ from face_id import (
 )
 
 # ── config ───────────────────────────────────────────
-ENROLL_DIR     = "/home/nvidia/Desktop/face_id/enrollments"
+ENROLL_DIR     = "/home/nvidia/Desktop/yolo11_jetson/enrollments"
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 # ────────────────────────────────────────────────────
+
+
+def _detect_with_augment(fi, image):
+    """
+    Try multiple scales and flips to maximise Haar detection recall.
+    Returns the first embedding found, or None.
+    """
+    transforms = [
+        lambda img: img,
+        lambda img: cv2.flip(img, 1),
+        lambda img: cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE),
+        lambda img: cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    ]
+    scales = [1.0, 1.5, 2.0]
+
+    for tfm in transforms:
+        t_img = tfm(image)
+        for scale in scales:
+            if scale != 1.0:
+                candidate = cv2.resize(t_img, (0, 0), fx=scale, fy=scale)
+            else:
+                candidate = t_img
+            emb, _ = fi.detect_and_embed(candidate)
+            if emb is not None:
+                return emb
+    return None
 
 
 def enroll_all():
@@ -47,7 +73,7 @@ def enroll_all():
         print("No person folders found to enroll.")
         return
 
-    print("[enroll] Loading engines...")
+    print("[enroll] Loading models...")
     fi = FaceIdentifier()
 
     total_added = 0
@@ -69,21 +95,11 @@ def enroll_all():
                 print(f"  [{name}] Failed to read: {img_path.name}")
                 continue
 
-            h, w = frame.shape[:2]
-            result = fi.identify(frame,
-                                 person_box=np.array([0, 0, w, h]),
-                                 track_id=-1)
-
-            if result["face_box"] is None:
+            emb = _detect_with_augment(fi, frame)
+            if emb is None:
                 print(f"  [{name}] No face detected: {img_path.name}")
                 continue
 
-            # re-extract embedding directly (identify() also compares DB,
-            # but we only need the embedding here)
-            fx1, fy1, fx2, fy2 = result["face_box"]
-            # face_box is in original frame coords since person_box starts at 0,0
-            face_crop = frame[fy1:fy2, fx1:fx2]
-            emb = fi._extract_embedding(face_crop)
             embeddings.append(emb)
             print(f"  [{name}] OK {img_path.name}")
 
@@ -101,6 +117,8 @@ def enroll_all():
         print(f"\n[enroll] Done -- {total_added} people enrolled, DB saved: {DB_PATH}")
     else:
         print("\n[enroll] No new people enrolled")
+
+    fi.close()
 
 
 if __name__ == "__main__":

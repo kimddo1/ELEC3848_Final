@@ -5,12 +5,14 @@ import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 import time
+from face_id import FaceIdentifier, draw_face_result
 
 # ── config ───────────────────────────────────────────
 ENGINE_PATH = "/home/nvidia/Desktop/yolo11_jetson/yolo11n.engine"
 INPUT_W, INPUT_H = 320, 320
 CONF_THRESH = 0.5
 IOU_THRESH  = 0.45
+FACE_ID_EVERY_N_FRAMES = 8  # run face ID once every N frames to save GPU
 PERSON_CLS  = 0          # COCO class 0 = person
 
 GST_PIPELINE = (
@@ -211,16 +213,16 @@ def postprocess(output, orig_w, orig_h):
     return boxes_xyxy[keep], confidences[keep]
 
 
-def draw(frame, active_tracks, verified_ids):
+def draw(frame, active_tracks, verified_ids, track_names):
     """
-    Verified tracks  → green box, "ID-xx ✓"
-    Unverified tracks → red box,   "ID-xx ?"
+    Verified tracks  → green box, person name
+    Unverified tracks → red box,  "Identifying..."
     """
     for tid, box in active_tracks.items():
         x1, y1, x2, y2 = box
         is_verified = tid in verified_ids
         color = (0, 200, 0) if is_verified else (0, 0, 220)
-        label = f"ID-{tid:02d} {'verified' if is_verified else 'unverified'}"
+        label = track_names.get(tid, "Identifying...") if is_verified else "Identifying..."
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame, label,
                     (x1, max(y1 - 8, 0)),
@@ -237,7 +239,9 @@ def main():
     context = engine.create_execution_context()
     inputs, outputs, bindings, stream = allocate_buffers(engine)
 
-    tracker = PersonTracker(max_disappeared=45, match_iou=0.3)
+    tracker     = PersonTracker(max_disappeared=45, match_iou=0.3)
+    face_id     = FaceIdentifier()
+    track_names = {}  # track_id -> verified person name
 
     print("[2/3] Opening camera...")
     cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
@@ -248,7 +252,8 @@ def main():
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[3/3] Starting inference ({orig_w}x{orig_h})")
 
-    prev_t = time.time()
+    prev_t   = time.time()
+    frame_no = 0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -268,18 +273,20 @@ def main():
         # ── tracking ───────────────────────────────
         active_tracks = tracker.update(boxes)
 
-        # ── face-ID hook (expose to colleague) ─────
-        # tracker.get_unverified_tracks() → list of (track_id, box)
-        # tracker.mark_verified(track_id) → call after successful face match
-        #
-        # Example (stub — replace with real face-recognition call):
-        #   for tid, box in tracker.get_unverified_tracks():
-        #       result = face_recognition_module.identify(frame, box)
-        #       if result.matched:
-        #           tracker.mark_verified(tid)
+        # ── face identification (throttled) ────────
+        if frame_no % FACE_ID_EVERY_N_FRAMES == 0:
+            for tid, box in tracker.get_unverified_tracks():
+                result = face_id.identify(frame, box, track_id=tid)
+                frame  = draw_face_result(frame, result)
+                if result["status"] == "verified":
+                    tracker.mark_verified(tid)
+                    track_names[tid] = result["name"]
+                elif result["status"] == "alert":
+                    pass  # TODO: trigger speaker + LED
+        frame_no += 1
 
         # ── display ────────────────────────────────
-        frame = draw(frame, active_tracks, tracker.verified)
+        frame = draw(frame, active_tracks, tracker.verified, track_names)
 
         now = time.time()
         fps = 1.0 / (now - prev_t + 1e-9)
