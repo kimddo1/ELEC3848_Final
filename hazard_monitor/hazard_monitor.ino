@@ -62,8 +62,11 @@ const float   FRONT_WALL_STOP_CM = 25.0f;
 // ============================================================
 const unsigned long FIRE_ALERT_DURATION_MS     = 10000UL;
 const unsigned long SECURITY_ALERT_DURATION_MS = 10000UL;
-const unsigned long VERIF_TIMEOUT_MS           = 8000UL;
+const unsigned long VERIF_TIMEOUT_MS           = 8000UL;  // fresh window after scan
 const unsigned long VERIF_SERVO_TRIGGER_MS     = 3000UL;
+const unsigned long VERIF_AUDIO_WAIT_MS        = 3000UL;  // approach_camera.wav duration
+const unsigned long VERIF_SERVO_HOLD_MS        = 3000UL;  // hold at 130° with white LED
+const int           VERIF_SERVO_MAX_DEG        = 130;
 
 // ============================================================
 // OLED config (friend's code logic reflected)
@@ -890,18 +893,35 @@ void runVerification()
   const unsigned long nowMs = millis();
   const unsigned long elapsed = nowMs - gModeStartMs;
 
-  // after 3 s with no response: sweep servo, change LED to red, request audio
   if (!gVerifServoScanned && elapsed >= VERIF_SERVO_TRIGGER_MS)
   {
     gVerifServoScanned = true;
+
+    // 1. Red LED + play audio, then wait for clip to finish
     setStatusLed(CRGB::Red);
     Serial.println(F("PLAY:approach_camera"));
-    runServoSweep();                   // ~1.9 s blocking — robot is stopped, acceptable
-    setStatusLed(CRGB(255, 80, 0));   // back to orange after sweep
-    drawVerificationOled();
+    delay(VERIF_AUDIO_WAIT_MS);
+
+    // 2. Sweep servo slowly from 90° to 130°
+    for (int a = SERVO_CENTER_DEG; a <= VERIF_SERVO_MAX_DEG; a += SERVO_STEP_DEG)
+    {
+      testServo.write(a);
+      delay(SERVO_STEP_DELAY_MS);
+    }
+
+    // 3. At 130°: white LED, hold 3 s
+    setStatusLed(CRGB::White);
+    delay(VERIF_SERVO_HOLD_MS);
+
+    // 4. Return servo to 90°
+    centerServo();
+
+    // 5. Scan done with no face → security alert immediately
+    enterSecurityAlert();
+    return;
   }
 
-  // hard timeout → security alert
+  // timeout before scan triggers → security alert
   if (elapsed >= VERIF_TIMEOUT_MS)
   {
     enterSecurityAlert();

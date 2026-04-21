@@ -72,26 +72,38 @@ def stop():
 
 
 def _generate_verified(name: str, wav_path: str):
-    """Generate verified_<name>.wav using pico2wave or espeak as fallback."""
+    """Generate verified_<name>.wav at 48 kHz using pico2wave or espeak."""
     os.makedirs(AUDIO_DIR, exist_ok=True)
     text = f"Identity verified. Welcome, {name}."
+    tmp = wav_path + ".tmp.wav"
 
-    if shutil.which("pico2wave"):
+    if shutil.which("pico2wave") and shutil.which("sox"):
         try:
-            subprocess.run(["pico2wave", "-w", wav_path, text],
+            subprocess.run(["pico2wave", "-w", tmp, text],
                            check=True, timeout=10)
-            print(f"[Audio] generated {wav_path} via pico2wave")
+            subprocess.run(["sox", tmp, "-r", "48000", wav_path],
+                           check=True, timeout=10)
+            os.remove(tmp)
+            print(f"[Audio] generated {wav_path} via pico2wave @ 48kHz")
             return
         except Exception as exc:
             print(f"[Audio] pico2wave failed: {exc}")
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
-    if shutil.which("espeak"):
+    if shutil.which("espeak") and shutil.which("sox"):
         try:
-            subprocess.run(["espeak", "-w", wav_path, text],
+            subprocess.run(["espeak", "-v", "en+m3", "-s", "130", "-p", "35",
+                            "-w", tmp, text],
                            check=True, timeout=10)
-            print(f"[Audio] generated {wav_path} via espeak")
+            subprocess.run(["sox", tmp, "-r", "48000", wav_path],
+                           check=True, timeout=10)
+            os.remove(tmp)
+            print(f"[Audio] generated {wav_path} via espeak @ 48kHz")
             return
         except Exception as exc:
             print(f"[Audio] espeak failed: {exc}")
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
-    print("[Audio] no TTS engine — install: sudo apt install libttspico-utils")
+    print("[Audio] no TTS engine — install: sudo apt install libttspico-utils sox")
