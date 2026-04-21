@@ -166,36 +166,43 @@ Save once per track transition — not per frame. Hook into `detect_people.py` w
 
 ## 8. Development Phases
 
-### Phase 1 — Motor control (blocker)
-- Decide drivetrain (2-wheel diff drive + caster? 4-wheel?). Pick motor driver (L298N / TB6612).
-- Add motor pin definitions to `hazard_monitor.ino` (or split into `patrol_controller.ino` if file gets large).
-- Write `driveForward(speed, ms)`, `turnLeft(deg)`, `turnRight(deg)`, `stop()`.
-- Test on bench without sensors active.
+### Phase 1 — Motor control ✅ DONE
+Implemented in `wall_bounce/wall_bounce.ino`.
+- 4-motor differential drive (M1–M4) with PWM, per-motor sign correction, scaling ratios, and trim.
+- Functions: `driveForward`, `driveBackward`, `rotateLeft`, `rotateRight`, `stopMotors`.
+- Tuned values: `PWM_FORWARD=42`, `TURN_RIGHT_90_MS=2550`, `TURN_LEFT_90_MS=2400`.
+- Motor pins: M1 PWM=12/IN1=34/IN2=35 · M2 PWM=8/IN1=37/IN2=36 · M3 PWM=9/IN1=43/IN2=42 · M4 PWM=5/IN1=A4/IN2=A5.
+- ⚠️ Merge into main firmware (Phase 4) — currently standalone file.
 
-### Phase 2 — Patrol loop
-- Implement timed square: forward 2.5 s → turn 90° → repeat. Tune on floor.
-- Add ultrasonic obstacle bail-out: if `U_front < 15 cm`, stop + back up + turn.
-- Confirm existing hazard monitoring still runs inline (it already does — `updateAlertOutputs()` is non-blocking).
+### Phase 2 — Patrol loop ✅ DONE
+Implemented in `wall_bounce/wall_bounce.ino`.
+- Wall-bounce navigation: drive forward → front ultrasonic poll (`FRONT_WALL_STOP_CM=25`) → stop → optional backup if < 12 cm → rotate 90° right → repeat.
+- Non-blocking per loop tick via `delay(LOOP_DELAY_MS=30)`.
+- U1 echo pin confirmed D32 — corrected in `wall_bounce.ino`.
+- ⚠️ Hazard sensor polling not yet integrated — will merge in Phase 4.
 
-### Phase 3 — Serial protocol
-- Add line-reader to Arduino `handleSerial()` for `PERSON_DETECTED` / `FACE_*` tokens.
-- Create `arduino_link.py` on Jetson: background thread reads serial, exposes `send(event)` and `on_command(callback)`.
-- Wire into `detect_people.py`:
-  - On new unverified track → `send("PERSON_DETECTED")`.
-  - On `mark_verified()` → `send(f"FACE_VERIFIED:{name}")`.
-  - On track expiry without verification → `send("FACE_TIMEOUT")`.
+### Phase 3 — Serial protocol ✅ DONE
+- `arduino_link.py` created: background thread reader/writer, auto-reconnect, heartbeat every 2 s, `send()` / `register_command_handler()` / `start()` / `stop()`.
+- `detect_people.py` wired up:
+  - New unverified track → `send("PERSON_DETECTED")` (once per track, tracked via `announced` set).
+  - `mark_verified()` → `send("FACE_VERIFIED:<name>")`.
+  - Face not found for 2 s (alert status) → `send("FACE_UNKNOWN")`.
+  - Track disappeared before verified → `send("FACE_TIMEOUT")`.
+  - `link.stop()` called at exit.
+- `hazard_monitor.ino` updated: `handleSerial()` now buffers full lines; `dispatchSingleChar()` preserves all existing commands; `dispatchJetsonLine()` parses `PERSON_DETECTED`, `FACE_VERIFIED:<name>`, `FACE_UNKNOWN`, `FACE_TIMEOUT`, `HEARTBEAT` with TODO stubs for Phase 4 actions.
+- Audio (`PLAY:`) and snapshot (`SNAP:`) Arduino→Jetson commands are stubbed in `default_command_handler()` — wired in Phases 5 and 7 respectively.
 
-### Phase 4 — Mode state machine (Arduino)
+### Phase 4 — Mode state machine ✅ DONE
 - Add `enum Mode { PATROL, FIRE_ALERT, VERIFICATION, SECURITY_ALERT }`.
 - Refactor `loop()`: dispatch to `runPatrol()`, `runFireAlert()`, `runVerification()`, `runSecurityAlert()`.
 - Each mode-runner is non-blocking — it advances its own timer per `loop()` tick.
 - Transition rules per §3 diagram.
 
-### Phase 5 — Audio
-- Record/generate 6 .wav files:
-  - `alert_fire.wav`, `alert_intruder.wav`, `detected_person.wav`, `approach_camera.wav`, `verified.wav`, (optional) `verified_<name>.wav`.
-- Add `audio_player.py` on Jetson: simple wrapper around `aplay` (subprocess) keyed by name. Pre-warm by playing a silent 0.1 s on startup.
-- Hook into `arduino_link.py` `on_command` for `PLAY:<name>`.
+### Phase 5 — Audio ✅ DONE
+- `audio_player.py` created: non-blocking `aplay` wrapper, kills previous clip on new play, auto-generates `verified_<name>.wav` via pico2wave/espeak on first use.
+- `audio/generate_clips.sh` created: generates all 5 fixed clips using pico2wave or espeak. Run once on Jetson: `bash audio/generate_clips.sh`.
+- `arduino_link.py` updated: `default_command_handler` now calls `audio_player.play(arg)` on `PLAY:` commands.
+- If USB speaker is not ALSA default, set `APLAY_DEVICE = "plughw:1,0"` (or correct index from `aplay -l`) in `audio_player.py`.
 
 ### Phase 6 — Servo scan during verification
 - When Arduino enters VERIFICATION, start a 3 s timer.

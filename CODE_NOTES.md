@@ -16,6 +16,10 @@ See SESSION_NOTES.md for environment, errors, pipeline architecture, and enrollm
 | `test_face_detect.py` | Standalone YOLO + SSD face detection test (no recognition) | Retired / reference only |
 | `hazard_monitor/hazard_monitor.ino` | Arduino firmware — LED, servo, buzzer, ultrasonic, OLED display | Active |
 | `Servo_test/Servo_test.ino` | Standalone servo test — smooth 90↔130° sweep via serial command | Reference |
+| `wall_bounce/wall_bounce.ino` | 4-motor drive + wall-bounce navigation (front ultrasonic) | Active |
+| `arduino_link.py` | Jetson-side USB serial bridge to Arduino Mega | Active |
+| `audio_player.py` | Non-blocking aplay wrapper + TTS fallback for verified_<name> | Active |
+| `audio/generate_clips.sh` | Shell script to generate all pre-recorded .wav clips via TTS | Run once |
 
 ---
 
@@ -312,6 +316,119 @@ DOWN_DELAY_MS = 40   // ms per degree going down (faster return)
 
 ---
 
+---
+
+## wall_bounce/wall_bounce.ino
+
+**Role:** Standalone Arduino Mega sketch implementing basic motor control and wall-bounce navigation. Phase 1 (motors) and Phase 2 (patrol loop) reference implementation — logic will be merged into main firmware in Phase 4.
+
+**Status:** Active / standalone. Not yet merged with `hazard_monitor.ino`.
+
+**Motor pins (4-motor differential drive):**
+
+| Motor | PWM | IN1 | IN2 |
+|---|---|---|---|
+| M1 (left front) | D12 | D34 | D35 |
+| M2 (right front) | D8 | D37 | D36 |
+| M3 (left rear) | D9 | D43 | D42 |
+| M4 (right rear) | D5 | A4 | A5 |
+
+`MOTOR_SIGN[4] = {-1, +1, -1, +1}` — corrects for opposite-facing motor orientations.
+
+**Ultrasonic pins (same layout as `hazard_monitor.ino` except U1 echo — see note below):**
+
+| Sensor | Role | Trig | Echo |
+|---|---|---|---|
+| U1 | Left | D33 | D40 ⚠️ |
+| U2 | Right | D28 | D25 |
+| U3 | Rear | D46 | D13 |
+| U4 | Front | D30 | D29 |
+
+U1 echo pin confirmed D32 — matches `hazard_monitor.ino`. Corrected in `wall_bounce.ino` Session 3.
+
+**Key functions:**
+
+| Function | Does |
+|---|---|
+| `writeMotorRaw(pwm, in1, in2, signedPwm)` | Low-level: sets H-bridge direction + PWM magnitude |
+| `writeMotorByIndex(index, signedPwm)` | Applies `MOTOR_SIGN`, `MOTOR_TRIM`, `motorRuntimeTrim` then calls `writeMotorRaw` |
+| `drive4(m1, m2, m3, m4)` | Sends signed PWM to all 4 motors simultaneously |
+| `driveTank(leftPwm, rightPwm)` | Left-side and right-side differential drive (applies `SIDE_BALANCE`) |
+| `driveForward(pwm)` | All motors forward with `FORWARD_RATIO` scaling |
+| `driveBackward(pwm)` | All motors backward with `BACKWARD_RATIO` scaling |
+| `rotateLeft(pwm)` / `rotateRight(pwm)` | Tank-style spin in place |
+| `stopMotors()` | Zero all motors |
+| `rotateNinetyDegreesLeft/Right()` | Timed 90° turn using `TURN_LEFT_90_MS=2400` / `TURN_RIGHT_90_MS=2550` |
+| `readDistanceCm(trig, echo)` | Single HC-SR04 ping; returns 999.0 on timeout or out-of-range |
+| `readDistanceMedianCm(trig, echo)` | 3-reading median for stability |
+| `goForwardUntilWallThenTurn()` | Core loop: poll front US → if ≤ 25 cm: stop + optional backup + turn right; else drive forward |
+
+**Key config:**
+```cpp
+PWM_FORWARD        = 42      // forward cruise PWM
+PWM_BACKUP         = 34      // short backup PWM
+PWM_TURN_90        = 28      // rotation PWM
+TURN_LEFT_90_MS    = 2400    // timed 90° left
+TURN_RIGHT_90_MS   = 2550    // timed 90° right
+FRONT_WALL_STOP_CM = 25.0    // stop threshold
+STOP_SETTLE_MS     = 150     // post-stop settle delay
+LOOP_DELAY_MS      = 30      // main loop tick
+FORWARD_RATIO[4]   = {0.9650, 0.8462, 0.9650, 0.8462}
+BACKWARD_RATIO[4]  = {1.0000, 0.8462, 1.0000, 0.8462}
+```
+
+---
+
+## arduino_link.py
+
+**Role:** Jetson-side USB serial bridge to Arduino Mega. Runs a background thread for continuous serial I/O. Imported by `detect_people.py`.
+
+**Key class: `ArduinoLink`**
+
+| Method | Does |
+|---|---|
+| `__init__(port, baud)` | Sets up send queue, handler list, stop event |
+| `register_command_handler(handler)` | Register callback `handler(cmd: str, arg: str)` for Arduino→Jetson commands |
+| `send(event)` | Queue a Jetson event string (non-blocking, thread-safe) |
+| `is_connected()` | Returns current connection state |
+| `start()` | Launches background daemon thread |
+| `stop()` | Sets stop event, joins thread (max 5 s) |
+| `_run()` | Thread body: connect, send heartbeats, flush outbound queue, read inbound lines, auto-reconnect on error |
+| `_dispatch(line)` | Parses inbound line; calls handlers for `PLAY`/`MODE`/`SNAP`, prints others as Arduino debug |
+
+**`default_command_handler(cmd, arg)`** — used by `detect_people.py`:
+- `PLAY:<name>` → stub (Phase 5: `audio_player.play(arg)`)
+- `MODE:<state>` → prints current Arduino mode
+- `SNAP:<category>` → stub (Phase 7: `snapshot_writer.save(frame, arg)`)
+
+**Jetson → Arduino events:**
+
+| Event | Sent when |
+|---|---|
+| `PERSON_DETECTED` | New unverified track appears (once per track via `announced` set) |
+| `FACE_VERIFIED:<name>` | `mark_verified()` called after DB match |
+| `FACE_UNKNOWN` | `face_id` alert status (no face for 2 s) |
+| `FACE_TIMEOUT` | Track disappeared from frame before verification |
+| `HEARTBEAT` | Automatically every 2 s by background thread |
+
+**Arduino → Jetson commands (received):**
+
+| Command | Meaning |
+|---|---|
+| `PLAY:<name>` | Play named audio clip |
+| `MODE:<state>` | Log current Arduino mode |
+| `SNAP:<category>` | Save snapshot frame |
+
+**Key config:**
+```python
+SERIAL_PORT          = "/dev/ttyUSB0"   # or /dev/ttyACM0
+SERIAL_BAUD          = 115200
+RECONNECT_DELAY_S    = 3.0
+HEARTBEAT_INTERVAL_S = 2.0
+```
+
+---
+
 ## Edit History
 
 ### face_id.py
@@ -331,6 +448,7 @@ DOWN_DELAY_MS = 40   // ms per degree going down (faster return)
 | Session 1 | Created — YOLO TRT inference, `PersonTracker`, face ID loop, `draw()` |
 | Session 1 | Added `track_names` dict; updated `draw()` to show person name instead of "verified" |
 | Session 2 | Added `face_id.close()` after main loop to prevent segfault on exit |
+| Session 3 | **Phase 3:** Imported `ArduinoLink` + `default_command_handler` from `arduino_link.py`. Added `ARDUINO_PORT` config. Added `announced` set for per-track `PERSON_DETECTED` dedup. Wired all 4 serial events: `PERSON_DETECTED` (new track), `FACE_VERIFIED:<name>` (on verify), `FACE_UNKNOWN` (alert status), `FACE_TIMEOUT` (track vanished). Added `link.stop()` at exit. |
 
 ### enroll.py
 | When | Change |
@@ -365,6 +483,29 @@ DOWN_DELAY_MS = 40   // ms per degree going down (faster return)
 |---|---|
 | Session 2 | Renamed from `stephen_code/stephen_code.ino` → `hazard_monitor/hazard_monitor.ino`. Arduino Mega firmware: WS2812B 24-LED panel, SG90 servo, passive buzzer, 4× HC-SR04 ultrasonic, 9-element IR flame sensor array, MQ-2 gas sensor, SSD1306 OLED. Serial 115200 baud. |
 | Session 3 | Full detail documented in CODE_NOTES.md (pins, thresholds, all functions, serial commands, alert behaviour). No code changes. |
+| Session 3 | **Phase 3:** Replaced single-char `handleSerial()` with line-buffered version. Added `dispatchSingleChar()` (preserves h/o/p/b/l/v/c), `dispatchJetsonLine()` (parses `PERSON_DETECTED`, `FACE_VERIFIED:<name>`, `FACE_UNKNOWN`, `FACE_TIMEOUT`, `HEARTBEAT`). Added forward declarations for both. |
+| Session 3 | **Phase 4:** Merged motor control from `wall_bounce.ino` (motor pins, drive functions, tuned ratios). Added `RobotMode` enum, `PatrolSubState` enum, `MotorPins` struct. Added mode globals. Added `enterPatrol/FireAlert/Verification/SecurityAlert()`, `runPatrol/FireAlert/Verification/SecurityAlert()`, `runCurrentMode()`. Added `drawVerificationOled()`, `drawSecurityAlertOled()`. Filled in `dispatchJetsonLine()` stubs. Updated `setup()` (adds `setupMotorPins`, `enterPatrol`). Updated `loop()` to call `updateHazardState` + `runCurrentMode` instead of `updateAlertOutputs`. Fire: 2200 Hz buzzer. Security: 3500 Hz buzzer. |
+
+### wall_bounce/wall_bounce.ino
+| When | Change |
+|---|---|
+| Session 3 | Created. 4-motor differential drive + wall-bounce navigation. Phase 1 (motors) and Phase 2 (patrol) implementation. Standalone file — merge into main firmware in Phase 4. |
+
+### arduino_link.py
+| When | Change |
+|---|---|
+| Session 3 | Created. Jetson-side USB serial bridge. Background thread, auto-reconnect, heartbeat, `send()`/`register_command_handler()`. Wired into `detect_people.py`. |
+| Session 3 | **Phase 5:** Imported `audio_player`. Updated `default_command_handler` — `PLAY:` now calls `audio_player.play(arg)` instead of stub. |
+
+### audio_player.py
+| When | Change |
+|---|---|
+| Session 3 | Created. Non-blocking `aplay` subprocess wrapper. `play(name)` kills previous clip then starts new one. Auto-generates `verified_<name>.wav` via pico2wave/espeak on first use. `APLAY_DEVICE` config for non-default USB speaker. |
+
+### audio/generate_clips.sh
+| When | Change |
+|---|---|
+| Session 3 | Created. Generates `alert_fire.wav`, `alert_intruder.wav`, `detected_person.wav`, `approach_camera.wav`, `verified.wav` using pico2wave or espeak. Run once on Jetson. |
 
 ### Servo_test/Servo_test.ino
 | When | Change |
@@ -376,3 +517,4 @@ DOWN_DELAY_MS = 40   // ms per degree going down (faster return)
 |---|---|
 | Session 2 | Created |
 | Session 3 | Added `Servo_test/Servo_test.ino` to file index and full detail section. Expanded `hazard_monitor/hazard_monitor.ino` section with full pin table, all functions, serial commands, config values, and alert behaviour. |
+| Session 3 | Added `wall_bounce/wall_bounce.ino` and `arduino_link.py` — file index entries, full detail sections, edit history rows. |

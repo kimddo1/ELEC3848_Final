@@ -6,6 +6,7 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 import time
 from face_id import FaceIdentifier, draw_face_result
+from arduino_link import ArduinoLink, default_command_handler
 
 # ── config ───────────────────────────────────────────
 ENGINE_PATH = "/home/nvidia/Desktop/yolo11_jetson/yolo11n.engine"
@@ -14,6 +15,7 @@ CONF_THRESH = 0.5
 IOU_THRESH  = 0.45
 FACE_ID_EVERY_N_FRAMES = 8  # run face ID once every N frames to save GPU
 PERSON_CLS  = 0          # COCO class 0 = person
+ARDUINO_PORT = "/dev/ttyUSB0"   # change to /dev/ttyACM0 if needed
 
 GST_PIPELINE = (
     "nvarguscamerasrc ! "
@@ -241,7 +243,12 @@ def main():
 
     tracker     = PersonTracker(max_disappeared=45, match_iou=0.3)
     face_id     = FaceIdentifier()
-    track_names = {}  # track_id -> verified person name
+    track_names = {}   # track_id -> verified person name
+    announced   = set()  # track_ids for which PERSON_DETECTED was already sent
+
+    link = ArduinoLink(port=ARDUINO_PORT)
+    link.register_command_handler(default_command_handler)
+    link.start()
 
     print("[2/3] Opening camera...")
     cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
@@ -273,6 +280,18 @@ def main():
         # ── tracking ───────────────────────────────
         active_tracks = tracker.update(boxes)
 
+        # ── serial: detect disappeared unverified tracks ────
+        vanished = announced - tracker.verified - set(active_tracks.keys())
+        for tid in vanished:
+            link.send("FACE_TIMEOUT")
+            announced.discard(tid)
+
+        # ── serial: announce new unverified tracks ──────────
+        for tid in active_tracks:
+            if tid not in tracker.verified and tid not in announced:
+                link.send("PERSON_DETECTED")
+                announced.add(tid)
+
         # ── face identification (throttled) ────────
         if frame_no % FACE_ID_EVERY_N_FRAMES == 0:
             for tid, box in tracker.get_unverified_tracks():
@@ -281,8 +300,11 @@ def main():
                 if result["status"] == "verified":
                     tracker.mark_verified(tid)
                     track_names[tid] = result["name"]
+                    link.send(f"FACE_VERIFIED:{result['name']}")
+                    announced.discard(tid)
                 elif result["status"] == "alert":
-                    pass  # TODO: trigger speaker + LED
+                    # face_id: no face detected for NO_FACE_TIMEOUT seconds
+                    link.send("FACE_UNKNOWN")
         frame_no += 1
 
         # ── display ────────────────────────────────
@@ -301,6 +323,7 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     face_id.close()
+    link.stop()
 
 
 if __name__ == "__main__":

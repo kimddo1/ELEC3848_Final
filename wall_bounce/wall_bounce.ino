@@ -26,7 +26,7 @@ const unsigned long SERIAL_BAUD = 115200UL;
 // Assumption: first pin = TRIG, second pin = ECHO
 // -----------------------------
 const uint8_t US_LEFT_TRIG   = 33;  // U1 digital  = PC4 = D33
-const uint8_t US_LEFT_ECHO   = 40;  // U1 analog   = PG1 = D40
+const uint8_t US_LEFT_ECHO   = 32;  // U1 analog   = PG1 = D32
 
 const uint8_t US_RIGHT_TRIG  = 28;  // U2 digital  = PA6 = D28
 const uint8_t US_RIGHT_ECHO  = 25;  // U2 analog   = PA3 = D25

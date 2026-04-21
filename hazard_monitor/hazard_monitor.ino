@@ -31,6 +31,41 @@ const int SERVO_STEP_DEG = 2;
 const int SERVO_STEP_DELAY_MS = 55;
 
 // ============================================================
+// Motor config (merged from wall_bounce.ino)
+// ============================================================
+const uint8_t M1_PWM = 12;  const uint8_t M1_IN1 = 34;  const uint8_t M1_IN2 = 35;
+const uint8_t M2_PWM = 8;   const uint8_t M2_IN1 = 37;  const uint8_t M2_IN2 = 36;
+const uint8_t M3_PWM = 9;   const uint8_t M3_IN1 = 43;  const uint8_t M3_IN2 = 42;
+const uint8_t M4_PWM = 5;   const uint8_t M4_IN1 = A4;  const uint8_t M4_IN2 = A5;
+
+const int MOTOR_SIGN[4]  = { -1, +1, -1, +1 };
+const int MOTOR_TRIM[4]  = { 0, 0, 0, 0 };
+int motorRuntimeTrim[4]  = { 0, 0, 0, 0 };
+const int SIDE_BALANCE   = 0;
+
+const int   PWM_FORWARD        = 42;
+const int   PWM_BACKUP         = 34;
+const int   PWM_TURN_90        = 28;
+const float FORWARD_RATIO[4]   = { 0.9650f, 0.8462f, 0.9650f, 0.8462f };
+const float BACKWARD_RATIO[4]  = { 1.0000f, 0.8462f, 1.0000f, 0.8462f };
+const unsigned long TURN_LEFT_90_MS  = 2400UL;
+const unsigned long TURN_RIGHT_90_MS = 2550UL;
+const unsigned long STOP_SETTLE_MS   = 150UL;
+
+// Front ultrasonic for patrol (U4)
+const uint8_t PATROL_FRONT_TRIG = 30;  // PC7 / D30
+const uint8_t PATROL_FRONT_ECHO = 29;  // PA7 / D29
+const float   FRONT_WALL_STOP_CM = 25.0f;
+
+// ============================================================
+// Mode timing
+// ============================================================
+const unsigned long FIRE_ALERT_DURATION_MS     = 10000UL;
+const unsigned long SECURITY_ALERT_DURATION_MS = 10000UL;
+const unsigned long VERIF_TIMEOUT_MS           = 8000UL;
+const unsigned long VERIF_SERVO_TRIGGER_MS     = 3000UL;
+
+// ============================================================
 // OLED config (friend's code logic reflected)
 // SSD1306 I2C, try 0x3C first, then 0x3D
 // Mega: SDA=20, SCL=21
@@ -115,6 +150,20 @@ enum DualSensorIndex
 };
 
 // ============================================================
+// Robot mode + motor struct
+// ============================================================
+enum RobotMode { MODE_PATROL, MODE_FIRE_ALERT, MODE_VERIFICATION, MODE_SECURITY_ALERT };
+enum PatrolSubState { PSUB_FORWARD, PSUB_TURNING };
+
+struct MotorPins { uint8_t pwm; uint8_t in1; uint8_t in2; };
+const MotorPins MOTORS[4] = {
+  { M1_PWM, M1_IN1, M1_IN2 },
+  { M2_PWM, M2_IN1, M2_IN2 },
+  { M3_PWM, M3_IN1, M3_IN2 },
+  { M4_PWM, M4_IN1, M4_IN2 }
+};
+
+// ============================================================
 // Globals
 // ============================================================
 bool streamEnabled = true;
@@ -135,6 +184,13 @@ bool gHazardDetected = false;
 const char* gDirection = "NONE";
 const char* gHazardType = "NONE";
 
+// Mode state
+RobotMode      gMode            = MODE_PATROL;
+unsigned long  gModeStartMs     = 0;
+bool           gVerifServoScanned = false;
+PatrolSubState gPatrolSub       = PSUB_FORWARD;
+unsigned long  gPatrolTurnStartMs = 0;
+
 // ============================================================
 // Function declarations
 // ============================================================
@@ -142,31 +198,63 @@ int readAnalogAverage(uint8_t analogPin, int samples = ANALOG_SAMPLES);
 float readDistanceCm(uint8_t trigPin, uint8_t echoPin);
 float readDistanceMedian(uint8_t trigPin, uint8_t echoPin);
 
+// LED / servo
 void setStatusLed(const CRGB& color);
 void runLedTest();
 void centerServo();
 void runServoSweep();
+
+// Serial
 void printHelp();
 void printSnapshot();
+void dispatchSingleChar(char cmd);
+void dispatchJetsonLine(const char* line);
 void handleSerial();
 
+// Hazard
 bool sideFlameTriggered(int value);
 bool frontActive(int value);
 bool frontStrong(int value);
-
 void readAllHazardSensors();
 const char* getFrontDirectionFromCurrentReadings();
 const char* getOverallDirectionFromCurrentReadings();
 const char* getHazardTypeFromState(bool hazard, bool gasAlert, const char* direction);
 void updateHazardState(bool forceRead = false);
 
+// OLED
 bool isI2cPresent(uint8_t address);
 bool beginOledAtAddress(uint8_t address);
 void initOled();
 void drawNormalOled();
 void drawAlertOled(bool visible);
+void drawVerificationOled();
+void drawSecurityAlertOled(bool visible);
 
-void updateAlertOutputs();
+// Motors
+void setupMotorPins();
+void writeMotorRaw(uint8_t pwmPin, uint8_t in1, uint8_t in2, int signedPwm);
+void writeMotorByIndex(uint8_t index, int signedPwm);
+void drive4(int m1, int m2, int m3, int m4);
+void driveTank(int leftPwm, int rightPwm);
+int  scaleMotionPwm(int basePwm, float ratio);
+void driveForward(int pwm);
+void driveBackward(int pwm);
+void rotateLeft(int pwm);
+void rotateRight(int pwm);
+void stopMotors();
+void rotateNinetyDegreesRight();
+void rotateNinetyDegreesLeft();
+
+// Mode state machine
+void enterPatrol();
+void enterFireAlert();
+void enterVerification();
+void enterSecurityAlert();
+void runPatrol();
+void runFireAlert();
+void runVerification();
+void runSecurityAlert();
+void runCurrentMode();
 
 // ============================================================
 // Utility functions
@@ -264,6 +352,97 @@ void runServoSweep()
   delay(350);
 
   Serial.println(F("[SERVO] clockwise test done, centered"));
+}
+
+// ============================================================
+// Motor control (merged from wall_bounce.ino)
+// ============================================================
+void setupMotorPins()
+{
+  const uint8_t pins[][3] = {
+    { M1_PWM, M1_IN1, M1_IN2 },
+    { M2_PWM, M2_IN1, M2_IN2 },
+    { M3_PWM, M3_IN1, M3_IN2 },
+    { M4_PWM, M4_IN1, M4_IN2 }
+  };
+  for (uint8_t i = 0; i < 4; ++i)
+  {
+    pinMode(pins[i][0], OUTPUT);
+    pinMode(pins[i][1], OUTPUT);
+    pinMode(pins[i][2], OUTPUT);
+  }
+}
+
+void writeMotorRaw(uint8_t pwmPin, uint8_t in1, uint8_t in2, int signedPwm)
+{
+  signedPwm = constrain(signedPwm, -255, 255);
+  if (signedPwm > 0)       { digitalWrite(in1, HIGH); digitalWrite(in2, LOW);  analogWrite(pwmPin,  signedPwm); }
+  else if (signedPwm < 0)  { digitalWrite(in1, LOW);  digitalWrite(in2, HIGH); analogWrite(pwmPin, -signedPwm); }
+  else                     { digitalWrite(in1, LOW);  digitalWrite(in2, LOW);  analogWrite(pwmPin, 0); }
+}
+
+void writeMotorByIndex(uint8_t index, int signedPwm)
+{
+  if (signedPwm != 0)
+  {
+    int dir = (signedPwm > 0) ? 1 : -1;
+    int mag = constrain(abs(signedPwm) + MOTOR_TRIM[index] + motorRuntimeTrim[index], 0, 255);
+    signedPwm = dir * mag;
+  }
+  signedPwm *= MOTOR_SIGN[index];
+  writeMotorRaw(MOTORS[index].pwm, MOTORS[index].in1, MOTORS[index].in2, signedPwm);
+}
+
+int scaleMotionPwm(int basePwm, float ratio)
+{
+  return constrain((int)((float)basePwm * ratio + 0.5f), 0, 255);
+}
+
+void drive4(int m1, int m2, int m3, int m4)
+{
+  writeMotorByIndex(0, m1);
+  writeMotorByIndex(1, m2);
+  writeMotorByIndex(2, m3);
+  writeMotorByIndex(3, m4);
+}
+
+void driveTank(int leftPwm, int rightPwm)
+{
+  drive4(leftPwm - SIDE_BALANCE, rightPwm + SIDE_BALANCE,
+         leftPwm - SIDE_BALANCE, rightPwm + SIDE_BALANCE);
+}
+
+void stopMotors()   { drive4(0, 0, 0, 0); }
+
+void driveForward(int pwm)
+{
+  drive4(scaleMotionPwm(pwm, FORWARD_RATIO[0]),  scaleMotionPwm(pwm, FORWARD_RATIO[1]),
+         scaleMotionPwm(pwm, FORWARD_RATIO[2]),  scaleMotionPwm(pwm, FORWARD_RATIO[3]));
+}
+
+void driveBackward(int pwm)
+{
+  drive4(-scaleMotionPwm(pwm, BACKWARD_RATIO[0]), -scaleMotionPwm(pwm, BACKWARD_RATIO[1]),
+         -scaleMotionPwm(pwm, BACKWARD_RATIO[2]), -scaleMotionPwm(pwm, BACKWARD_RATIO[3]));
+}
+
+void rotateLeft(int pwm)  { driveTank( pwm, -pwm); }
+void rotateRight(int pwm) { driveTank(-pwm,  pwm); }
+
+void rotateNinetyDegreesRight()
+{
+  rotateRight(PWM_TURN_90);
+  delay(TURN_RIGHT_90_MS);
+  stopMotors();
+  delay(STOP_SETTLE_MS);
+}
+
+void rotateNinetyDegreesLeft()
+{
+  rotateLeft(PWM_TURN_90);
+  delay(TURN_LEFT_90_MS);
+  stopMotors();
+  delay(STOP_SETTLE_MS);
 }
 
 // ============================================================
@@ -508,8 +687,45 @@ void drawAlertOled(bool visible)
   display.display();
 }
 
+void drawVerificationOled()
+{
+  if (!oledReady) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(20, 0);
+  display.println(F("[ PERSON DETECTED ]"));
+  display.drawLine(0, 10, SCREEN_WIDTH - 1, 10, SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(10, 18);
+  display.println(F("SCANNING"));
+  display.setTextSize(1);
+  display.setCursor(10, 52);
+  display.println(F("Please face camera"));
+  display.display();
+}
+
+void drawSecurityAlertOled(bool visible)
+{
+  if (!oledReady) return;
+  display.clearDisplay();
+  if (!visible) { display.display(); return; }
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(28, 0);
+  display.println(F("!!! ALERT !!!"));
+  display.drawLine(0, 10, SCREEN_WIDTH - 1, 10, SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(4, 18);
+  display.println(F("INTRUDER"));
+  display.setCursor(4, 42);
+  display.println(F("DETECTED"));
+  display.display();
+}
+
 // ============================================================
-// LED + OLED fast alert update
+// LED + OLED fast alert update (legacy — kept for reference)
+// Replaced by runCurrentMode() in the main loop.
 // ============================================================
 void updateAlertOutputs()
 {
@@ -540,6 +756,194 @@ void updateAlertOutputs()
     alertBlinkOn = false;
     setStatusLed(CRGB::White);
     drawNormalOled();
+  }
+}
+
+// ============================================================
+// Mode state machine
+// ============================================================
+
+void enterPatrol()
+{
+  gMode = MODE_PATROL;
+  gModeStartMs = millis();
+  gPatrolSub = PSUB_FORWARD;
+  alertBlinkOn = false;
+  noTone(BUZZER_PIN);
+  setStatusLed(CRGB::White);
+  drawNormalOled();
+  Serial.println(F("[MODE] PATROL"));
+  Serial.println(F("MODE:PATROL"));
+}
+
+void enterFireAlert()
+{
+  gMode = MODE_FIRE_ALERT;
+  gModeStartMs = millis();
+  stopMotors();
+  alertBlinkOn = false;
+  lastBlinkMs = 0;
+  Serial.println(F("[MODE] FIRE_ALERT"));
+  Serial.println(F("MODE:FIRE_ALERT"));
+  Serial.println(F("PLAY:alert_fire"));
+}
+
+void enterVerification()
+{
+  gMode = MODE_VERIFICATION;
+  gModeStartMs = millis();
+  gVerifServoScanned = false;
+  stopMotors();
+  centerServo();
+  noTone(BUZZER_PIN);
+  setStatusLed(CRGB(255, 80, 0));  // orange
+  drawVerificationOled();
+  Serial.println(F("[MODE] VERIFICATION"));
+  Serial.println(F("MODE:VERIFICATION"));
+  Serial.println(F("PLAY:detected_person"));
+}
+
+void enterSecurityAlert()
+{
+  gMode = MODE_SECURITY_ALERT;
+  gModeStartMs = millis();
+  stopMotors();
+  centerServo();
+  alertBlinkOn = false;
+  lastBlinkMs = 0;
+  Serial.println(F("[MODE] SECURITY_ALERT"));
+  Serial.println(F("MODE:SECURITY_ALERT"));
+  Serial.println(F("PLAY:alert_intruder"));
+}
+
+// ── mode runners (called every loop tick) ─────────────────────────────────
+
+void runPatrol()
+{
+  // fire / gas takes priority — enter FIRE_ALERT immediately
+  if (gHazardDetected)
+  {
+    enterFireAlert();
+    return;
+  }
+
+  const unsigned long nowMs = millis();
+
+  if (gPatrolSub == PSUB_FORWARD)
+  {
+    const float frontCm = readDistanceMedian(PATROL_FRONT_TRIG, PATROL_FRONT_ECHO);
+
+    if (frontCm > 0.0f && frontCm <= FRONT_WALL_STOP_CM)
+    {
+      stopMotors();
+      delay(STOP_SETTLE_MS);
+      gPatrolSub = PSUB_TURNING;
+      gPatrolTurnStartMs = nowMs;
+      rotateRight(PWM_TURN_90);
+    }
+    else
+    {
+      driveForward(PWM_FORWARD);
+    }
+  }
+  else  // PSUB_TURNING
+  {
+    if (nowMs - gPatrolTurnStartMs >= TURN_RIGHT_90_MS)
+    {
+      stopMotors();
+      delay(STOP_SETTLE_MS);
+      gPatrolSub = PSUB_FORWARD;
+    }
+  }
+}
+
+void runFireAlert()
+{
+  const unsigned long nowMs = millis();
+
+  if (nowMs - lastBlinkMs >= ALERT_BLINK_MS)
+  {
+    lastBlinkMs = nowMs;
+    alertBlinkOn = !alertBlinkOn;
+
+    if (alertBlinkOn)
+    {
+      setStatusLed(CRGB::Red);
+      tone(BUZZER_PIN, 2200, (int)ALERT_BLINK_MS - 5);
+    }
+    else
+    {
+      setStatusLed(CRGB::Black);
+    }
+    drawAlertOled(alertBlinkOn);
+  }
+
+  if (nowMs - gModeStartMs >= FIRE_ALERT_DURATION_MS)
+  {
+    noTone(BUZZER_PIN);
+    enterPatrol();
+  }
+}
+
+void runVerification()
+{
+  const unsigned long nowMs = millis();
+  const unsigned long elapsed = nowMs - gModeStartMs;
+
+  // after 3 s with no response: sweep servo, change LED to red, request audio
+  if (!gVerifServoScanned && elapsed >= VERIF_SERVO_TRIGGER_MS)
+  {
+    gVerifServoScanned = true;
+    setStatusLed(CRGB::Red);
+    Serial.println(F("PLAY:approach_camera"));
+    runServoSweep();                   // ~1.9 s blocking — robot is stopped, acceptable
+    setStatusLed(CRGB(255, 80, 0));   // back to orange after sweep
+    drawVerificationOled();
+  }
+
+  // hard timeout → security alert
+  if (elapsed >= VERIF_TIMEOUT_MS)
+  {
+    enterSecurityAlert();
+  }
+}
+
+void runSecurityAlert()
+{
+  const unsigned long nowMs = millis();
+
+  if (nowMs - lastBlinkMs >= ALERT_BLINK_MS)
+  {
+    lastBlinkMs = nowMs;
+    alertBlinkOn = !alertBlinkOn;
+
+    if (alertBlinkOn)
+    {
+      setStatusLed(CRGB::Red);
+      tone(BUZZER_PIN, 3500, (int)ALERT_BLINK_MS - 5);  // higher tone than fire
+    }
+    else
+    {
+      setStatusLed(CRGB::Black);
+    }
+    drawSecurityAlertOled(alertBlinkOn);
+  }
+
+  if (nowMs - gModeStartMs >= SECURITY_ALERT_DURATION_MS)
+  {
+    noTone(BUZZER_PIN);
+    enterPatrol();
+  }
+}
+
+void runCurrentMode()
+{
+  switch (gMode)
+  {
+    case MODE_PATROL:         runPatrol();        break;
+    case MODE_FIRE_ALERT:     runFireAlert();     break;
+    case MODE_VERIFICATION:   runVerification();  break;
+    case MODE_SECURITY_ALERT: runSecurityAlert(); break;
   }
 }
 
@@ -645,58 +1049,161 @@ void printSnapshot()
   }
 }
 
+// ============================================================
+// Serial line reader — handles both single-char interactive
+// commands and multi-token Jetson event strings.
+// ============================================================
+
+static char  sLineBuf[80];
+static uint8_t sLineLen = 0;
+
+void dispatchSingleChar(char cmd)
+{
+  switch (cmd)
+  {
+    case 'h':
+      printHelp();
+      break;
+
+    case 'o':
+      printSnapshot();
+      break;
+
+    case 'p':
+      streamEnabled = !streamEnabled;
+      Serial.print(F("[STREAM] "));
+      Serial.println(streamEnabled ? F("ON") : F("OFF"));
+      break;
+
+    case 'b':
+      tone(BUZZER_PIN, 2200, 150);
+      Serial.println(F("[BUZZER] short beep"));
+      break;
+
+    case 'l':
+      runLedTest();
+      updateHazardState(true);
+      if (gHazardDetected)
+      {
+        setStatusLed(CRGB::Black);
+        drawAlertOled(false);
+      }
+      else
+      {
+        setStatusLed(CRGB::White);
+        drawNormalOled();
+      }
+      break;
+
+    case 'v':
+      runServoSweep();
+      break;
+
+    case 'c':
+      centerServo();
+      break;
+
+    default:
+      break;
+  }
+}
+
+void dispatchJetsonLine(const char* line)
+{
+  // ── PERSON_DETECTED ────────────────────────────────────────
+  if (strcmp(line, "PERSON_DETECTED") == 0)
+  {
+    Serial.println(F("[JETSON] PERSON_DETECTED"));
+    if (gMode == MODE_PATROL)
+    {
+      enterVerification();
+    }
+  }
+
+  // ── FACE_VERIFIED:<name> ───────────────────────────────────
+  else if (strncmp(line, "FACE_VERIFIED:", 14) == 0)
+  {
+    const char* name = line + 14;
+    Serial.print(F("[JETSON] FACE_VERIFIED: "));
+    Serial.println(name);
+    if (gMode == MODE_VERIFICATION)
+    {
+      noTone(BUZZER_PIN);
+      setStatusLed(CRGB::Green);
+      Serial.print(F("PLAY:verified_"));
+      Serial.println(name);
+      delay(1000);
+      enterPatrol();
+    }
+  }
+
+  // ── FACE_UNKNOWN ───────────────────────────────────────────
+  else if (strcmp(line, "FACE_UNKNOWN") == 0)
+  {
+    Serial.println(F("[JETSON] FACE_UNKNOWN"));
+    if (gMode == MODE_VERIFICATION)
+    {
+      enterSecurityAlert();
+    }
+  }
+
+  // ── FACE_TIMEOUT ───────────────────────────────────────────
+  else if (strcmp(line, "FACE_TIMEOUT") == 0)
+  {
+    Serial.println(F("[JETSON] FACE_TIMEOUT"));
+    if (gMode == MODE_VERIFICATION)
+    {
+      enterSecurityAlert();
+    }
+  }
+
+  // ── HEARTBEAT ──────────────────────────────────────────────
+  else if (strcmp(line, "HEARTBEAT") == 0)
+  {
+    // silently acknowledge — uncomment next line to debug:
+    // Serial.println(F("[JETSON] HEARTBEAT"));
+  }
+
+  // ── unknown ────────────────────────────────────────────────
+  else
+  {
+    Serial.print(F("[SERIAL] unknown: "));
+    Serial.println(line);
+  }
+}
+
 void handleSerial()
 {
   while (Serial.available() > 0)
   {
-    const char command = (char)tolower((unsigned char)Serial.read());
+    const char c = (char)Serial.read();
 
-    switch (command)
+    if (c == '\r') continue;  // ignore CR (Windows line endings)
+
+    if (c == '\n')
     {
-      case 'h':
-        printHelp();
-        break;
+      sLineBuf[sLineLen] = '\0';
 
-      case 'o':
-        printSnapshot();
-        break;
+      if (sLineLen == 1)
+      {
+        // single interactive command — keep existing behaviour
+        dispatchSingleChar((char)tolower((unsigned char)sLineBuf[0]));
+      }
+      else if (sLineLen > 1)
+      {
+        // multi-char line from Jetson
+        dispatchJetsonLine(sLineBuf);
+      }
 
-      case 'p':
-        streamEnabled = !streamEnabled;
-        Serial.print(F("[STREAM] "));
-        Serial.println(streamEnabled ? F("ON") : F("OFF"));
-        break;
-
-      case 'b':
-        tone(BUZZER_PIN, 2200, 150);
-        Serial.println(F("[BUZZER] short beep"));
-        break;
-
-      case 'l':
-        runLedTest();
-        updateHazardState(true);
-        if (gHazardDetected)
-        {
-          setStatusLed(CRGB::Black);
-          drawAlertOled(false);
-        }
-        else
-        {
-          setStatusLed(CRGB::White);
-          drawNormalOled();
-        }
-        break;
-
-      case 'v':
-        runServoSweep();
-        break;
-
-      case 'c':
-        centerServo();
-        break;
-
-      default:
-        break;
+      sLineLen = 0;
+    }
+    else
+    {
+      if (sLineLen < sizeof(sLineBuf) - 1)
+      {
+        sLineBuf[sLineLen++] = c;
+      }
+      // silently drop chars if buffer overflows
     }
   }
 }
@@ -721,6 +1228,9 @@ void setup()
     digitalWrite(kUltrasonicSensors[i].trigPin, LOW);
   }
 
+  setupMotorPins();
+  stopMotors();
+
   pinMode(BUZZER_PIN, OUTPUT);
   noTone(BUZZER_PIN);
 
@@ -743,12 +1253,15 @@ void setup()
 
   printHelp();
   printSnapshot();
+
+  enterPatrol();  // start in patrol mode
 }
 
 void loop()
 {
   handleSerial();
-  updateAlertOutputs();
+  updateHazardState(false);  // always poll sensors (rate-limited to 100 ms internally)
+  runCurrentMode();          // mode-specific outputs, transitions, motor drive
 
   const unsigned long nowMs = millis();
   if (streamEnabled && (nowMs - lastStreamMs) >= STREAM_INTERVAL_MS)
