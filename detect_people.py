@@ -7,6 +7,7 @@ import pycuda.autoinit
 import time
 from face_id import FaceIdentifier, draw_face_result
 from arduino_link import ArduinoLink, default_command_handler
+import snapshot_writer
 
 # ── config ───────────────────────────────────────────
 ENGINE_PATH = "/home/nvidia/Desktop/yolo11_jetson/yolo11n.engine"
@@ -243,8 +244,9 @@ def main():
 
     tracker     = PersonTracker(max_disappeared=45, match_iou=0.3)
     face_id     = FaceIdentifier()
-    track_names = {}   # track_id -> verified person name
-    announced   = set()  # track_ids for which PERSON_DETECTED was already sent
+    track_names  = {}    # track_id -> verified person name
+    announced    = set() # track_ids for which PERSON_DETECTED was already sent
+    face_snapped = set() # track_ids for which a "face" snapshot was already saved
 
     link = ArduinoLink(port=ARDUINO_PORT)
     link.register_command_handler(default_command_handler)
@@ -267,6 +269,8 @@ def main():
             print("Failed to read frame")
             break
 
+        snapshot_writer.update_frame(frame)   # keep latest frame for SNAP: commands
+
         # ── inference ──────────────────────────────
         inp = preprocess(frame)
         np.copyto(inputs[0]["host"], inp.ravel())
@@ -284,27 +288,38 @@ def main():
         vanished = announced - tracker.verified - set(active_tracks.keys())
         for tid in vanished:
             link.send("FACE_TIMEOUT")
+            snapshot_writer.log_event("FACE_TIMEOUT", tid, "", "")
             announced.discard(tid)
+            face_snapped.discard(tid)
 
         # ── serial: announce new unverified tracks ──────────
-        for tid in active_tracks:
+        for tid, box in active_tracks.items():
             if tid not in tracker.verified and tid not in announced:
                 link.send("PERSON_DETECTED")
                 announced.add(tid)
+                snapshot_writer.save(frame, box, "person", tid)
 
         # ── face identification (throttled) ────────
         if frame_no % FACE_ID_EVERY_N_FRAMES == 0:
             for tid, box in tracker.get_unverified_tracks():
                 result = face_id.identify(frame, box, track_id=tid)
                 frame  = draw_face_result(frame, result)
+                # ── face snapshot (first time a face is found in this track) ──
+                if result["status"] in ("verified", "unknown") and tid not in face_snapped:
+                    snapshot_writer.save(frame, box, "face", tid)
+                    face_snapped.add(tid)
+
                 if result["status"] == "verified":
                     tracker.mark_verified(tid)
                     track_names[tid] = result["name"]
                     link.send(f"FACE_VERIFIED:{result['name']}")
                     announced.discard(tid)
+                    snapshot_writer.save(frame, box, "verified", tid, result["name"])
+                    snapshot_writer.log_event("FACE_VERIFIED", tid, result["name"], "")
                 elif result["status"] == "alert":
                     # face_id: no face detected for NO_FACE_TIMEOUT seconds
                     link.send("FACE_UNKNOWN")
+                    snapshot_writer.log_event("FACE_UNKNOWN", tid, "", "")
         frame_no += 1
 
         # ── display ────────────────────────────────

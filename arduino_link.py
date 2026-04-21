@@ -27,6 +27,7 @@ import time
 import serial
 from typing import Callable, List, Optional
 import audio_player
+import snapshot_writer
 
 # ── config ────────────────────────────────────────────────────────────────────
 SERIAL_PORT          = "/dev/ttyUSB0"   # try /dev/ttyACM0 if this fails
@@ -188,5 +189,4 @@ def default_command_handler(cmd: str, arg: str):
         print(f"[Arduino mode] {arg}")
 
     elif cmd == "SNAP":
-        print(f"[Snapshot] STUB — would save category: {arg}")
-        # Phase 7: snapshot_writer.save(current_frame, arg)
+        snapshot_writer.save_current(arg)

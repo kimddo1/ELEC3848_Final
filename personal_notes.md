@@ -204,19 +204,33 @@ Implemented in `wall_bounce/wall_bounce.ino`.
 - `arduino_link.py` updated: `default_command_handler` now calls `audio_player.play(arg)` on `PLAY:` commands.
 - If USB speaker is not ALSA default, set `APLAY_DEVICE = "plughw:1,0"` (or correct index from `aplay -l`) in `audio_player.py`.
 
-### Phase 6 — Servo scan during verification
-- When Arduino enters VERIFICATION, start a 3 s timer.
-- If no `FACE_VERIFIED` / `FACE_UNKNOWN` by then, trigger slow servo sweep 90° → 130° (reuse `Servo_test` logic inline).
-- Return servo to 90° on state exit.
+### Phase 6 — Servo scan during verification ✅ DONE
+- After 3 s no face: Arduino sets LED red, sends `PLAY:approach_camera`, blocks 3000 ms (audio duration).
+- Sweeps servo 90° → 130° (2°/step, 55 ms/step).
+- LED white, holds 3 s at 130°.
+- `centerServo()` → immediately calls `enterSecurityAlert()` — no extra wait.
+- Constants: `VERIF_SERVO_TRIGGER_MS=3000`, `VERIF_AUDIO_WAIT_MS=3000`, `VERIF_SERVO_HOLD_MS=3000`, `VERIF_SERVO_MAX_DEG=130`.
 
-### Phase 7 — Snapshots & logging
-- Add `snapshot_writer.py` on Jetson — saves frame crop + metadata.
-- Call at each track transition (see §6).
+### Phase 7 — Snapshots & logging ✅ DONE
+- `snapshot_writer.py` created: `update_frame()`, `save()`, `save_current()`, `log_event()`.
+- Saves JPEG crops to `snapshots/{person,face,verified}/`. Creates dirs on first use.
+- Logs to `logs/events.csv` (auto-creates header on first write).
+- Wired into `detect_people.py`:
+  - New track → `save(frame, box, "person", tid)`.
+  - First frame with face detected (status "verified" or "unknown") → `save(frame, box, "face", tid)`. Tracked via `face_snapped` set.
+  - Verified → `save(frame, box, "verified", tid, name)` + `log_event("FACE_VERIFIED", ...)`.
+  - FACE_TIMEOUT → `log_event("FACE_TIMEOUT", ...)`.
+  - FACE_UNKNOWN → `log_event("FACE_UNKNOWN", ...)`.
+- `arduino_link.py` updated: `SNAP:<category>` now calls `snapshot_writer.save_current(arg)` (uses last frame from `update_frame`).
 
-### Phase 8 — Remote link
-- Wire HC-05 to Arduino Serial1 (pins 18 TX / 19 RX on Mega).
-- Send JSON-ish lines on entering FIRE_ALERT / SECURITY_ALERT.
-- Receiver: simple Python script on remote laptop using `pyserial` over BT-serial port.
+### Phase 8 — Remote link ✅ DONE
+- HC-05 wires to Arduino Serial3: HC-05 TX → Mega pin 15 (RX3), HC-05 RX → Mega pin 14 (TX3) via 1kΩ+2kΩ divider (3.3 V logic). VCC → 5 V, GND → GND.
+- `Serial3.begin(9600)` in `setup()`.
+- `btSendFireAlert()` — called from `enterFireAlert()`. Sends: `{"type":"fire","subtype":"FLAME|SMOKE_GAS|BOTH","dir":"<dir>","ts":<ms>}`
+- `btSendSecurityAlert()` — called from `enterSecurityAlert()`. Sends: `{"type":"intruder","ts":<ms>}`
+- `btSend(msg)` helper mirrors the line to `Serial` (USB) as `[BT->] ...` for debugging.
+- `bt_receiver.py` created: connects to paired HC-05 BT serial port, parses JSON lines, prints formatted alert. Auto-reconnects on disconnect.
+- Pair HC-05 first (PIN 1234 or 0000), set `BT_PORT` in `bt_receiver.py`, run `python3 bt_receiver.py`.
 
 ### Phase 9 — Polish & demo
 - Re-enroll Noah with 5 clean photos (pending from Session 2).

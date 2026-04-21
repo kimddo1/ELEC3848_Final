@@ -19,7 +19,9 @@ See SESSION_NOTES.md for environment, errors, pipeline architecture, and enrollm
 | `wall_bounce/wall_bounce.ino` | 4-motor drive + wall-bounce navigation (front ultrasonic) | Active |
 | `arduino_link.py` | Jetson-side USB serial bridge to Arduino Mega | Active |
 | `audio_player.py` | Non-blocking aplay wrapper + TTS fallback for verified_<name> | Active |
+| `snapshot_writer.py` | Saves JPEG frame crops + CSV event log at each track transition | Active |
 | `audio/generate_clips.sh` | Shell script to generate all pre-recorded .wav clips via TTS | Run once |
+| `bt_receiver.py` | Remote laptop script — reads HC-05 BT serial, prints formatted alerts | Run on laptop |
 
 ---
 
@@ -379,6 +381,49 @@ BACKWARD_RATIO[4]  = {1.0000, 0.8462, 1.0000, 0.8462}
 
 ---
 
+## snapshot_writer.py
+
+**Role:** Saves JPEG crops of detected persons and logs events to CSV. Imported by `detect_people.py` and `arduino_link.py`.
+
+**Public functions:**
+
+| Function | Does |
+|---|---|
+| `update_frame(frame)` | Store the latest BGR camera frame. Call every main loop tick. |
+| `save(frame, box, category, track_id, name="")` | Crop `box` from `frame`, write to `snapshots/<category>/`, log a `<CATEGORY>_SNAP` event. Returns saved path or `""` on failure. `box=None` saves full frame. |
+| `save_current(category, track_id=-1, name="")` | Like `save()` but uses the last frame from `update_frame()`. Called by `arduino_link` on `SNAP:` commands from Arduino. |
+| `log_event(event, track_id, name, mode)` | Append one row to `logs/events.csv`. Creates file + header if missing. |
+
+**Output layout:**
+```
+snapshots/
+  person/     — <category>_<tid>_<timestamp>.jpg  (new YOLO track)
+  face/       — <category>_<tid>_<timestamp>.jpg  (first SCRFD face detected)
+  verified/   — <category>_<tid>_<timestamp>.jpg  (face matched DB)
+logs/
+  events.csv  — timestamp, event, track_id, name, mode
+```
+
+**events.csv event types:**
+| Event | Logged when |
+|---|---|
+| `PERSON_SNAP` | New person track snapshot saved |
+| `FACE_SNAP` | Face-detected snapshot saved |
+| `VERIFIED_SNAP` | Verified snapshot saved |
+| `FACE_VERIFIED` | Face matched DB (log row only, no image) |
+| `FACE_UNKNOWN` | No face for timeout period |
+| `FACE_TIMEOUT` | Person left frame without verification |
+
+**Key config:**
+```python
+SNAP_DIR     = "<script_dir>/snapshots"
+LOG_DIR      = "<script_dir>/logs"
+LOG_FILE     = "<script_dir>/logs/events.csv"
+JPEG_QUALITY = 92
+```
+
+---
+
 ## arduino_link.py
 
 **Role:** Jetson-side USB serial bridge to Arduino Mega. Runs a background thread for continuous serial I/O. Imported by `detect_people.py`.
@@ -449,6 +494,7 @@ HEARTBEAT_INTERVAL_S = 2.0
 | Session 1 | Added `track_names` dict; updated `draw()` to show person name instead of "verified" |
 | Session 2 | Added `face_id.close()` after main loop to prevent segfault on exit |
 | Session 3 | **Phase 3:** Imported `ArduinoLink` + `default_command_handler` from `arduino_link.py`. Added `ARDUINO_PORT` config. Added `announced` set for per-track `PERSON_DETECTED` dedup. Wired all 4 serial events: `PERSON_DETECTED` (new track), `FACE_VERIFIED:<name>` (on verify), `FACE_UNKNOWN` (alert status), `FACE_TIMEOUT` (track vanished). Added `link.stop()` at exit. |
+| Session 3 | **Phase 7:** Imported `snapshot_writer`. Added `face_snapped` set. Added `snapshot_writer.update_frame(frame)` each tick. Save: `person` crop on new track, `face` crop on first face detection (status verified/unknown), `verified` crop + log on match. Log `FACE_TIMEOUT` and `FACE_UNKNOWN` events. Changed new-track loop to `items()` to access box. |
 
 ### enroll.py
 | When | Change |
@@ -496,11 +542,27 @@ HEARTBEAT_INTERVAL_S = 2.0
 |---|---|
 | Session 3 | Created. Jetson-side USB serial bridge. Background thread, auto-reconnect, heartbeat, `send()`/`register_command_handler()`. Wired into `detect_people.py`. |
 | Session 3 | **Phase 5:** Imported `audio_player`. Updated `default_command_handler` — `PLAY:` now calls `audio_player.play(arg)` instead of stub. |
+| Session 3 | **Phase 7:** Imported `snapshot_writer`. Updated `default_command_handler` — `SNAP:` now calls `snapshot_writer.save_current(arg)` instead of stub. |
+
+### hazard_monitor/hazard_monitor.ino (Phase 8 additions)
+| When | Change |
+|---|---|
+| Session 3 | **Phase 8:** Added `BT_BAUD=9600` config. Added `Serial1.begin(BT_BAUD)` in `setup()`. Added `btSend()`, `btSendFireAlert()`, `btSendSecurityAlert()` + forward declarations. Called `btSendFireAlert()` from `enterFireAlert()`, `btSendSecurityAlert()` from `enterSecurityAlert()`. JSON format: fire=`{"type":"fire","subtype":"...","dir":"...","ts":...}`, intruder=`{"type":"intruder","ts":...}`. |
 
 ### audio_player.py
 | When | Change |
 |---|---|
 | Session 3 | Created. Non-blocking `aplay` subprocess wrapper. `play(name)` kills previous clip then starts new one. Auto-generates `verified_<name>.wav` via pico2wave/espeak on first use. `APLAY_DEVICE` config for non-default USB speaker. |
+
+### snapshot_writer.py
+| When | Change |
+|---|---|
+| Session 3 | **Phase 7:** Created. `update_frame()`, `save()`, `save_current()`, `log_event()`. Saves JPEG crops to `snapshots/{person,face,verified}/`. Appends to `logs/events.csv` (auto-creates header). `JPEG_QUALITY=92`. |
+
+### bt_receiver.py
+| When | Change |
+|---|---|
+| Session 3 | **Phase 8:** Created. Connects to HC-05 paired BT port, reads JSON alert lines, pretty-prints with local timestamp. Auto-reconnects on disconnect. Set `BT_PORT` before running. |
 
 ### audio/generate_clips.sh
 | When | Change |

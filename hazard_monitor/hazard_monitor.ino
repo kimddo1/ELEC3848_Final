@@ -58,6 +58,13 @@ const uint8_t PATROL_FRONT_ECHO = 29;  // PA7 / D29
 const float   FRONT_WALL_STOP_CM = 25.0f;
 
 // ============================================================
+// Bluetooth remote link (HC-05 on Serial3)
+// Mega Serial3: TX=14, RX=15
+// HC-05 default baud: 9600
+// ============================================================
+const unsigned long BT_BAUD = 9600UL;
+
+// ============================================================
 // Mode timing
 // ============================================================
 const unsigned long FIRE_ALERT_DURATION_MS     = 10000UL;
@@ -247,6 +254,11 @@ void rotateRight(int pwm);
 void stopMotors();
 void rotateNinetyDegreesRight();
 void rotateNinetyDegreesLeft();
+
+// Bluetooth remote link
+void btSend(const char* msg);
+void btSendFireAlert();
+void btSendSecurityAlert();
 
 // Mode state machine
 void enterPatrol();
@@ -763,6 +775,34 @@ void updateAlertOutputs()
 }
 
 // ============================================================
+// Bluetooth remote link
+// ============================================================
+
+void btSend(const char* msg)
+{
+  Serial3.println(msg);
+  Serial.print(F("[BT->] "));
+  Serial.println(msg);
+}
+
+void btSendFireAlert()
+{
+  char buf[100];
+  snprintf(buf, sizeof(buf),
+    "{\"type\":\"fire\",\"subtype\":\"%s\",\"dir\":\"%s\",\"ts\":%lu}",
+    gHazardType, gDirection, millis());
+  btSend(buf);
+}
+
+void btSendSecurityAlert()
+{
+  char buf[48];
+  snprintf(buf, sizeof(buf),
+    "{\"type\":\"intruder\",\"ts\":%lu}", millis());
+  btSend(buf);
+}
+
+// ============================================================
 // Mode state machine
 // ============================================================
 
@@ -789,6 +829,7 @@ void enterFireAlert()
   Serial.println(F("[MODE] FIRE_ALERT"));
   Serial.println(F("MODE:FIRE_ALERT"));
   Serial.println(F("PLAY:alert_fire"));
+  btSendFireAlert();
 }
 
 void enterVerification()
@@ -817,6 +858,7 @@ void enterSecurityAlert()
   Serial.println(F("[MODE] SECURITY_ALERT"));
   Serial.println(F("MODE:SECURITY_ALERT"));
   Serial.println(F("PLAY:alert_intruder"));
+  btSendSecurityAlert();
 }
 
 // ── mode runners (called every loop tick) ─────────────────────────────────
@@ -1234,6 +1276,8 @@ void handleSerial()
 void setup()
 {
   Serial.begin(SERIAL_BAUD);
+  Serial3.begin(BT_BAUD);   // HC-05 on TX3=D14, RX3=D15
+  Serial.println(F("[BT] Serial3 ready"));
 
   for (size_t i = 0; i < (sizeof(kDualSensors) / sizeof(kDualSensors[0])); ++i)
   {
