@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 import pickle
 import time
-import urllib.request
 import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -13,54 +12,45 @@ import pycuda.autoinit
 
 # ── config ───────────────────────────────────────────
 BASE_DIR   = "/home/nvidia/Desktop/yolo11_jetson"
-MODEL_DIR  = os.path.join(BASE_DIR, "face_models")
 DB_PATH    = os.path.join(BASE_DIR, "face_db.pkl")
 
-SSD_PROTOTXT      = os.path.join(MODEL_DIR, "deploy.prototxt")
-SSD_CAFFEMODEL    = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000_fp16.caffemodel")
-EMBED_ENGINE_PATH = os.path.join(BASE_DIR, "face_embed.engine")
+DET_ENGINE_PATH   = os.path.join(BASE_DIR, "face_det.engine")    # SCRFD TRT
+EMBED_ENGINE_PATH = os.path.join(BASE_DIR, "face_embed.engine")  # MobileFaceNet TRT
 
-DET_CONF_THRESH = 0.5    # SSD face detection confidence
+SCRFD_INPUT_W, SCRFD_INPUT_H = 640, 640  # engine was built at this fixed size
+SCRFD_STRIDES    = [8, 16, 32]
+SCRFD_NUM_ANCHORS = 2                    # anchors per spatial location
+
+DET_CONF_THRESH = 0.5    # SCRFD face detection confidence
+NMS_IOU_THRESH  = 0.45   # NMS IoU threshold
 SIM_THRESH      = 0.45   # cosine similarity threshold for a positive match
 NO_FACE_TIMEOUT = 2.0    # seconds before triggering alert
 
-EMBED_INPUT_W, EMBED_INPUT_H = 112, 112  # ArcFace/MobileFaceNet input
+EMBED_INPUT_W, EMBED_INPUT_H = 112, 112  # MobileFaceNet input
 
 UNKNOWN_LABEL = "unknown"
 
-# SFace canonical landmark positions for 112×112 aligned crop
-_SFACE_DST_LANDMARKS = np.array(
-    [[38.2946, 51.6963],
-     [73.5318, 51.5014],
-     [56.0252, 71.7366],
-     [41.5493, 92.3655],
-     [70.7299, 92.2041]],
+# ArcFace canonical 5-point landmark positions for 112×112 aligned crop
+_REF_LANDMARKS = np.array(
+    [[38.2946, 51.6963],   # left eye
+     [73.5318, 51.5014],   # right eye
+     [56.0252, 71.7366],   # nose tip
+     [41.5493, 92.3655],   # left mouth corner
+     [70.7299, 92.2041]],  # right mouth corner
     dtype=np.float32,
 )
 # ─────────────────────────────────────────────────────
 
 
-# ── Model download ────────────────────────────────────────────────────────────
-
-def _download(url: str, path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    print(f"[face_id] Downloading {os.path.basename(path)} ...")
-    urllib.request.urlretrieve(url, tmp)
-    os.rename(tmp, path)
-    print(f"[face_id] Saved -> {path}")
-
+# ── Engine check ─────────────────────────────────────────────────────────────
 
 def ensure_models():
-    if not os.path.isfile(SSD_PROTOTXT) or not os.path.isfile(SSD_CAFFEMODEL):
+    missing = [p for p in (DET_ENGINE_PATH, EMBED_ENGINE_PATH)
+               if not os.path.isfile(p)]
+    if missing:
         raise RuntimeError(
-            "SSD face detection models not found in {}.\n"
-            "Download them first:\n"
-            "  wget https://raw.githubusercontent.com/opencv/opencv/master"
-            "/samples/dnn/face_detector/deploy.prototxt\n"
-            "  wget https://raw.githubusercontent.com/opencv/opencv_3rdparty"
-            "/dnn_samples_face_detector_20180205_fp16"
-            "/res10_300x300_ssd_iter_140000_fp16.caffemodel".format(MODEL_DIR)
+            "TRT engine(s) not found:\n" +
+            "\n".join(f"  {p}" for p in missing)
         )
 
 
@@ -117,53 +107,155 @@ class FaceDatabase:
         print(f"[DB] Loaded <- {self.db_path}  ({len(self.records)} people)")
 
 
-# ── Face detector (OpenCV DNN SSD ResNet-10) ──────────────────────────────────
+# ── Face detector (SCRFD TRT — GPU) ──────────────────────────────────────────
 
-class _SSDDetector:
+class _SCRFDDetector:
     """
-    OpenCV DNN SSD face detector (res10_300x300).
-    Works on any OpenCV 3.3+ with DNN support.
-    Outputs [N, 15] format using synthetic landmarks so the
-    rest of the pipeline (alignment + embedding) is unchanged.
+    SCRFD face detector via TensorRT.
+    Input : 640×640 RGB, normalised to [-1, 1]  (same norm as InsightFace repo)
+    Output: 9 bindings — score + bbox + kps for strides 8, 16, 32
+
+    detect() returns array shape [N, 15]:
+        [x, y, w, h,  lm0x, lm0y, ..., lm4x, lm4y,  score]
+    This matches the format expected by _align_face() and the rest of the pipeline.
     """
 
     def __init__(self):
-        self._net = cv2.dnn.readNetFromCaffe(SSD_PROTOTXT, SSD_CAFFEMODEL)
-        backend = getattr(cv2.dnn, "DNN_BACKEND_CUDA", None)
-        target  = getattr(cv2.dnn, "DNN_TARGET_CUDA",  None)
-        if backend is not None and target is not None:
-            self._net.setPreferableBackend(backend)
-            self._net.setPreferableTarget(target)
-            print("[face_id] SSD detector: CUDA backend")
-        else:
-            print("[face_id] SSD detector: CPU backend")
+        logger = trt.Logger(trt.Logger.WARNING)
+        with open(DET_ENGINE_PATH, "rb") as f, trt.Runtime(logger) as rt:
+            engine = rt.deserialize_cuda_engine(f.read())
+
+        self._ctx    = engine.create_execution_context()
+        self._ctx.set_binding_shape(0, (1, 3, SCRFD_INPUT_H, SCRFD_INPUT_W))
+        self._stream = cuda.Stream()
+        self._inputs, self._outputs, self._bindings = [], [], []
+
+        for i, binding in enumerate(engine):
+            shape = self._ctx.get_binding_shape(i)
+            size  = int(trt.volume(shape))
+            dtype = trt.nptype(engine.get_binding_dtype(binding))
+            h_mem = cuda.pagelocked_empty(size, dtype)
+            d_mem = cuda.mem_alloc(h_mem.nbytes)
+            self._bindings.append(int(d_mem))
+            if engine.binding_is_input(binding):
+                self._inputs.append({"host": h_mem, "device": d_mem})
+            else:
+                self._outputs.append({"host": h_mem, "device": d_mem})
+
+        # pre-compute anchor centres for each stride (reused every frame)
+        self._anchors = _build_scrfd_anchors(
+            SCRFD_INPUT_H, SCRFD_INPUT_W, SCRFD_STRIDES, SCRFD_NUM_ANCHORS
+        )
+        print("[face_id] SCRFD detector: TRT GPU")
 
     def detect(self, image: np.ndarray) -> np.ndarray:
-        """Returns array shape [N, 15]: [x,y,w,h, 5×landmark xy, score]"""
-        h, w = image.shape[:2]
-        blob = cv2.dnn.blobFromImage(image, 1.0, (300, 300), (104, 177, 123))
-        self._net.setInput(blob)
-        dets = self._net.forward()   # [1, 1, N, 7]
+        """
+        image : BGR crop (any size) — resized internally to 640×640.
+        Returns [N, 15] float32: [x, y, w, h, 5×lm_xy, score]
+        Coordinates are scaled back to the input image size.
+        """
+        orig_h, orig_w = image.shape[:2]
+        sx = orig_w / SCRFD_INPUT_W
+        sy = orig_h / SCRFD_INPUT_H
 
-        faces = []
-        for i in range(dets.shape[2]):
-            conf = float(dets[0, 0, i, 2])
-            if conf < DET_CONF_THRESH:
-                continue
-            x1 = max(0, int(dets[0, 0, i, 3] * w))
-            y1 = max(0, int(dets[0, 0, i, 4] * h))
-            x2 = min(w, int(dets[0, 0, i, 5] * w))
-            y2 = min(h, int(dets[0, 0, i, 6] * h))
-            bw, bh = x2 - x1, y2 - y1
-            if bw <= 0 or bh <= 0:
-                continue
-            lm = _synthetic_landmarks(float(x1), float(y1), float(bw), float(bh))
-            faces.append([float(x1), float(y1), float(bw), float(bh)]
-                         + lm.reshape(-1).tolist() + [conf])
+        # preprocess: resize → RGB → [-1,1] → NCHW
+        resized = cv2.resize(image, (SCRFD_INPUT_W, SCRFD_INPUT_H))
+        rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        inp     = (rgb.astype(np.float32) - 127.5) / 128.0
+        inp     = np.ascontiguousarray(np.transpose(inp, (2, 0, 1))[np.newaxis])
 
-        if not faces:
+        np.copyto(self._inputs[0]["host"], inp.ravel())
+        cuda.memcpy_htod_async(
+            self._inputs[0]["device"], self._inputs[0]["host"], self._stream)
+        self._ctx.execute_async_v2(
+            bindings=self._bindings, stream_handle=self._stream.handle)
+        for out in self._outputs:
+            cuda.memcpy_dtoh_async(out["host"], out["device"], self._stream)
+        self._stream.synchronize()
+
+        # decode outputs: 3 strides × (score, bbox, kps) = 9 output tensors
+        # engine binding order: score8, bbox8, kps8, score16, bbox16, kps16, score32, bbox32, kps32
+        all_faces = []
+        for s_idx, stride in enumerate(SCRFD_STRIDES):
+            scores = self._outputs[s_idx * 3 + 0]["host"].reshape(-1, 1)
+            bboxes = self._outputs[s_idx * 3 + 1]["host"].reshape(-1, 4)
+            kpss   = self._outputs[s_idx * 3 + 2]["host"].reshape(-1, 10)
+
+            anchors = self._anchors[stride]  # [M, 2] cx,cy
+            mask    = scores[:, 0] >= DET_CONF_THRESH
+            if not np.any(mask):
+                continue
+
+            scores  = scores[mask, 0]
+            bboxes  = bboxes[mask]
+            kpss    = kpss[mask]
+            anchors = anchors[mask]
+
+            # decode bbox: ltrb distances → x1y1x2y2
+            x1 = anchors[:, 0] - bboxes[:, 0] * stride
+            y1 = anchors[:, 1] - bboxes[:, 1] * stride
+            x2 = anchors[:, 0] + bboxes[:, 2] * stride
+            y2 = anchors[:, 1] + bboxes[:, 3] * stride
+
+            # decode landmarks: offset from anchor centre
+            # anchors[:, 0:1] is (M,1) → broadcasts with kpss[:, 0::2] (M,5)
+            lm = np.stack([
+                anchors[:, 0:1] + kpss[:, 0::2] * stride,  # [M, 5] x
+                anchors[:, 1:2] + kpss[:, 1::2] * stride,  # [M, 5] y
+            ], axis=2).reshape(-1, 10)                      # [M, 10] interleaved x0y0x1y1...
+
+            # scale back to original image size
+            x1 *= sx;  x2 *= sx
+            y1 *= sy;  y2 *= sy
+            lm[:, 0::2] *= sx
+            lm[:, 1::2] *= sy
+
+            bw = x2 - x1
+            bh = y2 - y1
+            for i in range(len(scores)):
+                if bw[i] > 0 and bh[i] > 0:
+                    all_faces.append(
+                        [x1[i], y1[i], bw[i], bh[i]]
+                        + lm[i].tolist()
+                        + [float(scores[i])]
+                    )
+
+        if not all_faces:
             return np.empty((0, 15), dtype=np.float32)
-        return np.asarray(faces, dtype=np.float32)
+
+        faces = np.asarray(all_faces, dtype=np.float32)
+        # NMS on [x1,y1,w,h] boxes
+        boxes_xywh = faces[:, :4].tolist()
+        scores_lst = faces[:, 14].tolist()
+        keep = cv2.dnn.NMSBoxes(boxes_xywh, scores_lst, DET_CONF_THRESH, NMS_IOU_THRESH)
+        if len(keep) == 0:
+            return np.empty((0, 15), dtype=np.float32)
+        return faces[keep.flatten()]
+
+    def close(self):
+        del self._ctx
+
+
+# ── SCRFD anchor builder ──────────────────────────────────────────────────────
+
+def _build_scrfd_anchors(input_h, input_w, strides, num_anchors):
+    """
+    Pre-compute anchor centre points for all strides.
+    Returns dict: stride -> np.ndarray [M, 2] (cx, cy) in input-image pixels.
+    """
+    anchors = {}
+    for stride in strides:
+        fh = input_h // stride
+        fw = input_w // stride
+        cy, cx = np.mgrid[0:fh, 0:fw]
+        # each location has num_anchors anchors with the same centre
+        cx = np.stack([cx] * num_anchors, axis=2).reshape(-1).astype(np.float32)
+        cy = np.stack([cy] * num_anchors, axis=2).reshape(-1).astype(np.float32)
+        # convert grid index to pixel position (centre of each cell)
+        anchors[stride] = np.stack(
+            [(cx + 0.5) * stride, (cy + 0.5) * stride], axis=1
+        )
+    return anchors
 
 
 # ── Face embedder (TRT MobileFaceNet — GPU) ───────────────────────────────────
@@ -238,19 +330,13 @@ def _largest_face(faces: np.ndarray) -> Optional[np.ndarray]:
     return max(faces, key=lambda f: float(f[2] * f[3]))
 
 
-def _synthetic_landmarks(x, y, w, h) -> np.ndarray:
-    return np.array(
-        [[x + 0.35*w, y + 0.40*h], [x + 0.65*w, y + 0.40*h],
-         [x + 0.50*w, y + 0.58*h], [x + 0.38*w, y + 0.76*h],
-         [x + 0.62*w, y + 0.76*h]], dtype=np.float32)
-
-
 def _align_face(image: np.ndarray, face: np.ndarray) -> np.ndarray:
+    """Warp face crop to 112×112 using 5 SCRFD landmarks."""
     landmarks = face[4:14].reshape(5, 2)
-    mat, _ = cv2.estimateAffinePartial2D(landmarks, _SFACE_DST_LANDMARKS,
+    mat, _ = cv2.estimateAffinePartial2D(landmarks, _REF_LANDMARKS,
                                           method=cv2.LMEDS)
     if mat is None:
-        mat = cv2.getAffineTransform(landmarks[:3], _SFACE_DST_LANDMARKS[:3])
+        mat = cv2.getAffineTransform(landmarks[:3], _REF_LANDMARKS[:3])
     return cv2.warpAffine(image, mat, (112, 112), flags=cv2.INTER_LINEAR)
 
 
@@ -287,11 +373,11 @@ class FaceIdentifier:
     def __init__(self):
         ensure_models()
         print("[face_id] Loading models...")
-        self._detector = _SSDDetector()
+        self._detector = _SCRFDDetector()
         self._encoder  = _TRTEmbedder()
         self.db        = FaceDatabase(DB_PATH)
         self._no_face_since = {}  # type: Dict[int, float]
-        print("[face_id] Ready (YuNet detection + TRT GPU embedding)")
+        print("[face_id] Ready (SCRFD TRT detection + MobileFaceNet TRT embedding)")
 
     def identify(self, frame: np.ndarray, person_box: np.ndarray,
                  track_id: int = -1) -> dict:
@@ -350,6 +436,7 @@ class FaceIdentifier:
         return embedding, face_box
 
     def close(self):
+        self._detector.close()
         self._encoder.close()
 
     # ── private ─────────────────────────────────────

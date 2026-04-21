@@ -300,6 +300,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    face_id.close()
 
 
 if __name__ == "__main__":
