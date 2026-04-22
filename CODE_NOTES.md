@@ -20,7 +20,7 @@ See SESSION_NOTES.md for environment, errors, pipeline architecture, and enrollm
 | `arduino_link.py` | Jetson-side USB serial bridge to Arduino Mega | Active |
 | `audio_player.py` | Non-blocking aplay wrapper + TTS fallback for verified_<name> | Active |
 | `snapshot_writer.py` | Saves JPEG frame crops + CSV event log at each track transition | Active |
-| `audio/generate_clips.sh` | Shell script to generate all pre-recorded .wav clips via TTS | Run once |
+| `generate_audio.py` | Generates all required WAV clips via espeak+sox (run once on Jetson) | Run once |
 | `bt_receiver.py` | Remote laptop script — reads HC-05 BT serial, prints formatted alerts | Run on laptop |
 
 ---
@@ -495,6 +495,11 @@ HEARTBEAT_INTERVAL_S = 2.0
 | Session 2 | Added `face_id.close()` after main loop to prevent segfault on exit |
 | Session 3 | **Phase 3:** Imported `ArduinoLink` + `default_command_handler` from `arduino_link.py`. Added `ARDUINO_PORT` config. Added `announced` set for per-track `PERSON_DETECTED` dedup. Wired all 4 serial events: `PERSON_DETECTED` (new track), `FACE_VERIFIED:<name>` (on verify), `FACE_UNKNOWN` (alert status), `FACE_TIMEOUT` (track vanished). Added `link.stop()` at exit. |
 | Session 3 | **Phase 7:** Imported `snapshot_writer`. Added `face_snapped` set. Added `snapshot_writer.update_frame(frame)` each tick. Save: `person` crop on new track, `face` crop on first face detection (status verified/unknown), `verified` crop + log on match. Log `FACE_TIMEOUT` and `FACE_UNKNOWN` events. Changed new-track loop to `items()` to access box. |
+| Session 4 | **Bug fix A:** Added `UNKNOWN_CONFIRM_COUNT=3` constant and `face_unknown_count{}` dict. `FACE_UNKNOWN` now requires 3 consecutive "unknown" frames — prevents false SECURITY_ALERT when ArcFace misses a single frame while the enrolled person is still present. Count resets on "verified" or non-unknown status. |
+| Session 4 | **Bug fix B:** Changed vanish detection from `set(active_tracks.keys())` to `set(tracker.tracks.keys())`. `active_tracks` only holds `gone==0` tracks; a single missed detection frame was incorrectly sending `FACE_TIMEOUT`, blocking the Arduino servo scan trigger. `tracker.tracks` holds all IDs until fully pruned (gone > max_disappeared=45). |
+| Session 4 | Changed `ARDUINO_PORT` default from `/dev/ttyUSB0` to `/dev/ttyACM0` (genuine Arduino Mega uses ATmega16U2 → ACM device). Replaced `try/except KeyboardInterrupt` with SIGINT flag (`_shutdown`) + `os._exit(0)` to prevent pycuda core dump on exit. |
+| Session 4 | Added `_send(link, msg, note)` helper — wraps `link.send()` with clean `[Jetson→Arduino]` terminal print. Added `last_face_status` dict to suppress repeated face-status prints (only prints on change). Replaced all bare `link.send()` calls with `_send()`. Cleaned startup messages. |
+| Session 4 | Added `ANNOUNCE_CONFIRM_FRAMES=8` gate on `PERSON_DETECTED`: a new track must be continuously active for 8 consecutive frames before Arduino is notified. Prevents ghost re-ID tracks (verified person's box briefly misses IoU match → new track ID that lasts <45 frames) from triggering a false verification cycle. `announce_count{}` dict tracks per-track frame count; pruned alongside the vanish handler. |
 
 ### enroll.py
 | When | Change |
@@ -548,11 +553,22 @@ HEARTBEAT_INTERVAL_S = 2.0
 | When | Change |
 |---|---|
 | Session 3 | **Phase 8:** Added `BT_BAUD=9600` config. Added `Serial1.begin(BT_BAUD)` in `setup()`. Added `btSend()`, `btSendFireAlert()`, `btSendSecurityAlert()` + forward declarations. Called `btSendFireAlert()` from `enterFireAlert()`, `btSendSecurityAlert()` from `enterSecurityAlert()`. JSON format: fire=`{"type":"fire","subtype":"...","dir":"...","ts":...}`, intruder=`{"type":"intruder","ts":...}`. |
+| Session 4 | **Bug fix:** `runVerification()` was calling `enterSecurityAlert()` unconditionally at the end of the servo scan, before reading the serial buffer. During ~8.5 s of blocking delays (`delay()`) `handleSerial()` never ran, so `FACE_VERIFIED` accumulated unread. Fix: after `centerServo()`, call `handleSerial()` to flush buffer; if `gMode` changed (verified), return; otherwise reset `gModeStartMs` and return — post-scan VERIF_TIMEOUT_MS window gives Jetson time to respond. Second `if` block now guarded with `gVerifServoScanned`. |
+| Session 4 | Set `streamEnabled = false` by default — stops 500 ms sensor-dump spam on the serial line. Press 'p' in Arduino Serial Monitor to re-enable for sensor debugging. |
+| Session 4 | Added `printHazardTrigger()` — called once on `enterFireAlert()`. Prints only the sensors that exceeded their threshold (side/back IR < SIDE_FLAME_THRESHOLD, front IR > FRONT_ACTIVE_TH, gas >= GAS_THRESHOLD) with raw analog values and the applicable threshold, so false-trigger thresholds can be tuned. Added `frontCount=N/FRONT_STABLE_COUNT` to the summary line. |
+| Session 4 | **Front IR debounce:** Added `FRONT_STABLE_COUNT=8`, `gFrontCount`, `gFrontAlert`. `updateHazardState()` now counts consecutive reads where any front sensor exceeds `FRONT_ACTIVE_TH`; only sets `gFrontAlert` after 8 consecutive reads (~800 ms). If direction resolves to a FRONT_* string but `gFrontAlert` is false, direction is overridden to "NONE" — prevents a single ambient-IR spike (body heat, lighting) from triggering FIRE_ALERT. Side/back sensors are unaffected. |
+| Session 4 | Fixed servo twitching during FIRE_ALERT and SECURITY_ALERT: `FastLED.show()` disables interrupts ~720 µs every 50 ms for LED blinking, corrupting the Servo library's 20 ms PWM pulse. Fix: `testServo.detach()` in `enterFireAlert()`; `testServo.attach(SERVO_PIN)` at start of `enterVerification()` and `enterSecurityAlert()` (with immediate detach again after centering in security alert). Also increased `VERIF_SERVO_TRIGGER_MS` 3000→6000 ms so `detected_person.wav` finishes before `approach_camera.wav` starts. |
 
 ### audio_player.py
 | When | Change |
 |---|---|
+| Session 4 | `default_command_handler`: MODE now prints a separator line for visibility; PLAY prints `[Arduino→Jetson] PLAY:<name>`. `_dispatch`: non-PLAY/MODE/SNAP lines print with `[Arduino]` prefix and blank lines suppressed. |
 | Session 3 | Created. Non-blocking `aplay` subprocess wrapper. `play(name)` kills previous clip then starts new one. Auto-generates `verified_<name>.wav` via pico2wave/espeak on first use. `APLAY_DEVICE` config for non-default USB speaker. |
+
+### generate_audio.py
+| When | Change |
+|---|---|
+| Session 4 | Created. Generates `alert_fire.wav`, `alert_intruder.wav`, `detected_person.wav`, `approach_camera.wav` into `audio/` using espeak+sox at 48 kHz. Run once on Jetson before starting main program. |
 
 ### snapshot_writer.py
 | When | Change |

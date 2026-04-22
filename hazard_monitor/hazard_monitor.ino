@@ -70,7 +70,7 @@ const unsigned long BT_BAUD = 9600UL;
 const unsigned long FIRE_ALERT_DURATION_MS     = 10000UL;
 const unsigned long SECURITY_ALERT_DURATION_MS = 10000UL;
 const unsigned long VERIF_TIMEOUT_MS           = 8000UL;  // fresh window after scan
-const unsigned long VERIF_SERVO_TRIGGER_MS     = 3000UL;
+const unsigned long VERIF_SERVO_TRIGGER_MS     = 6000UL;  // +3 s gap so detected_person.wav finishes before approach_camera.wav starts
 const unsigned long VERIF_AUDIO_WAIT_MS        = 3000UL;  // approach_camera.wav duration
 const unsigned long VERIF_SERVO_HOLD_MS        = 3000UL;  // hold at 130° with white LED
 const int           VERIF_SERVO_MAX_DEG        = 130;
@@ -94,10 +94,15 @@ uint8_t activeOledAddress = 0;
 // Hazard thresholds from measured values
 // ============================================================
 const int SIDE_FLAME_THRESHOLD = 300;   // IR_1 / IR_2 / IR_BACK: lower = flame
-const int FRONT_ACTIVE_TH      = 80;    // IR_5_x: higher = active
+const int FRONT_ACTIVE_TH      = 300;    // IR_5_x: higher = active
 const int FRONT_STRONG_TH      = 400;   // IR_5_x: higher = strong
 const int GAS_THRESHOLD        = 150;    // MQ-2 analog threshold
 const int GAS_STABLE_COUNT     = 3;
+// Front IR sensors see ambient IR (body heat, lighting) and need debounce.
+// A real flame stays above threshold for many consecutive reads;
+// a noise spike is usually 1-2 reads.  At HAZARD_SAMPLE_INTERVAL_MS=100 ms,
+// FRONT_STABLE_COUNT=8 means ~800 ms sustained reading before alert fires.
+const int FRONT_STABLE_COUNT   = 8;
 
 // ============================================================
 // Fast urgent blink timing
@@ -176,7 +181,7 @@ const MotorPins MOTORS[4] = {
 // ============================================================
 // Globals
 // ============================================================
-bool streamEnabled = true;
+bool streamEnabled = false;  // sensor stream off by default — press 'p' to toggle
 unsigned long lastStreamMs = 0;
 unsigned long lastHazardSampleMs = 0;
 unsigned long lastBlinkMs = 0;
@@ -190,6 +195,8 @@ int gDigitalValues[sizeof(kDualSensors) / sizeof(kDualSensors[0])] = {0};
 
 int gGasCount = 0;
 bool gGasAlert = false;
+int gFrontCount = 0;   // consecutive front-IR readings above FRONT_ACTIVE_TH
+bool gFrontAlert = false;
 bool gHazardDetected = false;
 const char* gDirection = "NONE";
 const char* gHazardType = "NONE";
@@ -217,6 +224,7 @@ void runServoSweep();
 // Serial
 void printHelp();
 void printSnapshot();
+void printHazardTrigger();
 void dispatchSingleChar(char cmd);
 void dispatchJetsonLine(const char* line);
 void handleSerial();
@@ -576,7 +584,28 @@ void updateHazardState(bool forceRead)
   }
 
   gGasAlert = (gGasCount >= GAS_STABLE_COUNT);
+
+  // Front IR debounce — require FRONT_STABLE_COUNT consecutive reads above
+  // FRONT_ACTIVE_TH before treating any front sensor as a real flame detection.
+  // This prevents single-sample ambient spikes (body heat, lighting) from
+  // falsely triggering FIRE_ALERT.
+  const bool anyFrontActive = frontActive(gAnalogValues[IDX_IR5_1]) ||
+                              frontActive(gAnalogValues[IDX_IR5_2]) ||
+                              frontActive(gAnalogValues[IDX_IR5_3]) ||
+                              frontActive(gAnalogValues[IDX_IR5_4]) ||
+                              frontActive(gAnalogValues[IDX_IR5_5]);
+  if (anyFrontActive) { gFrontCount++; } else { gFrontCount = 0; }
+  gFrontAlert = (gFrontCount >= FRONT_STABLE_COUNT);
+
   gDirection = getOverallDirectionFromCurrentReadings();
+
+  // If direction was set purely by front sensors but debounce hasn't confirmed,
+  // treat it as no hazard yet (side/back sensors are not gated here).
+  if (!gFrontAlert && strncmp(gDirection, "FRONT", 5) == 0)
+  {
+    gDirection = "NONE";
+  }
+
   gHazardDetected = (strcmp(gDirection, "NONE") != 0) || gGasAlert;
   gHazardType = getHazardTypeFromState(gHazardDetected, gGasAlert, gDirection);
 }
@@ -824,10 +853,14 @@ void enterFireAlert()
   gMode = MODE_FIRE_ALERT;
   gModeStartMs = millis();
   stopMotors();
+  // Detach servo so FastLED interrupt blocking (every 50 ms for LED blink)
+  // does not corrupt the servo PWM signal and cause twitching.
+  testServo.detach();
   alertBlinkOn = false;
   lastBlinkMs = 0;
   Serial.println(F("[MODE] FIRE_ALERT"));
   Serial.println(F("MODE:FIRE_ALERT"));
+  printHazardTrigger();   // log exactly which sensors fired and their raw values
   Serial.println(F("PLAY:alert_fire"));
   btSendFireAlert();
 }
@@ -838,6 +871,8 @@ void enterVerification()
   gModeStartMs = millis();
   gVerifServoScanned = false;
   stopMotors();
+  // Re-attach servo before using it (may have been detached during FIRE_ALERT).
+  testServo.attach(SERVO_PIN);
   centerServo();
   noTone(BUZZER_PIN);
   setStatusLed(CRGB(255, 80, 0));  // orange
@@ -852,7 +887,11 @@ void enterSecurityAlert()
   gMode = MODE_SECURITY_ALERT;
   gModeStartMs = millis();
   stopMotors();
+  // Re-attach in case servo was detached during FIRE_ALERT, center, then
+  // detach again so FastLED blinking does not cause twitching here either.
+  testServo.attach(SERVO_PIN);
   centerServo();
+  testServo.detach();
   alertBlinkOn = false;
   lastBlinkMs = 0;
   Serial.println(F("[MODE] SECURITY_ALERT"));
@@ -935,6 +974,7 @@ void runVerification()
   const unsigned long nowMs = millis();
   const unsigned long elapsed = nowMs - gModeStartMs;
 
+  // ── Phase 1: trigger servo scan after VERIF_SERVO_TRIGGER_MS ──────────────
   if (!gVerifServoScanned && elapsed >= VERIF_SERVO_TRIGGER_MS)
   {
     gVerifServoScanned = true;
@@ -958,14 +998,27 @@ void runVerification()
     // 4. Return servo to 90°
     centerServo();
 
-    // 5. Scan done with no face → security alert immediately
-    enterSecurityAlert();
+    // 5. Flush serial buffer — FACE_VERIFIED may have arrived during the
+    //    blocking delays above and is waiting to be read.
+    handleSerial();
+
+    // 6. If Jetson already resolved the mode (FACE_VERIFIED → enterPatrol
+    //    was called inside handleSerial), we are done.
+    if (gMode != MODE_VERIFICATION) return;
+
+    // 7. Scan done but no answer yet — reset timer to give Jetson
+    //    VERIF_TIMEOUT_MS to send FACE_VERIFIED / FACE_UNKNOWN / FACE_TIMEOUT.
+    Serial.println(F("[VERIF] scan done — waiting for Jetson response"));
+    gModeStartMs = millis();
     return;
   }
 
-  // timeout before scan triggers → security alert
-  if (elapsed >= VERIF_TIMEOUT_MS)
+  // ── Phase 2: post-scan response timeout ───────────────────────────────────
+  // Only runs after the servo scan has completed (gVerifServoScanned == true)
+  // and Jetson has not responded within VERIF_TIMEOUT_MS.
+  if (gVerifServoScanned && elapsed >= VERIF_TIMEOUT_MS)
   {
+    Serial.println(F("[VERIF] timeout — no Jetson response after scan"));
     enterSecurityAlert();
   }
 }
@@ -1109,6 +1162,90 @@ void printSnapshot()
   {
     Serial.println(F("[ULTRASONIC] obstacle within warning distance"));
   }
+}
+
+// ============================================================
+// Hazard trigger report — printed once when FIRE_ALERT is entered.
+// Shows every sensor that exceeded its threshold so you can tune values.
+// ============================================================
+void printHazardTrigger()
+{
+  Serial.println(F(""));
+  Serial.println(F("[HAZARD TRIGGER] Sensors that exceeded threshold:"));
+
+  // Side / back flame (IR_1, IR_2, IR_BACK) — lower value = more flame
+  const struct { uint8_t idx; const char* label; } sideSensors[] = {
+    { IDX_IR1,    "IR_1  (LEFT) " },
+    { IDX_IR2,    "IR_2  (RIGHT)" },
+    { IDX_IR_BACK,"IR_BACK      " },
+  };
+  for (uint8_t i = 0; i < 3; ++i)
+  {
+    int val = gAnalogValues[sideSensors[i].idx];
+    if (sideFlameTriggered(val))
+    {
+      Serial.print(F("  "));
+      Serial.print(sideSensors[i].label);
+      Serial.print(F(" A="));
+      Serial.print(val);
+      Serial.print(F("  threshold < "));
+      Serial.println(SIDE_FLAME_THRESHOLD);
+    }
+  }
+
+  // Front array (IR_5_1 … IR_5_5) — higher value = more flame
+  const struct { uint8_t idx; const char* label; } frontSensors[] = {
+    { IDX_IR5_1, "IR_5_1 (F-L2)" },
+    { IDX_IR5_2, "IR_5_2 (F-L1)" },
+    { IDX_IR5_3, "IR_5_3 (F-CTR)" },
+    { IDX_IR5_4, "IR_5_4 (F-R1)" },
+    { IDX_IR5_5, "IR_5_5 (F-R2)" },
+  };
+  for (uint8_t i = 0; i < 5; ++i)
+  {
+    int val = gAnalogValues[frontSensors[i].idx];
+    if (frontActive(val))
+    {
+      Serial.print(F("  "));
+      Serial.print(frontSensors[i].label);
+      Serial.print(F(" A="));
+      Serial.print(val);
+      if (frontStrong(val))
+      {
+        Serial.print(F("  STRONG (> "));
+        Serial.print(FRONT_STRONG_TH);
+        Serial.print(F(")"));
+      }
+      else
+      {
+        Serial.print(F("  active (> "));
+        Serial.print(FRONT_ACTIVE_TH);
+        Serial.print(F(")"));
+      }
+      Serial.println();
+    }
+  }
+
+  // Gas sensor
+  int gasVal = gAnalogValues[IDX_GAS];
+  if (gGasAlert)
+  {
+    Serial.print(F("  GAS           A="));
+    Serial.print(gasVal);
+    Serial.print(F("  threshold >= "));
+    Serial.println(GAS_THRESHOLD);
+  }
+
+  // Summary
+  Serial.print(F("[HAZARD TRIGGER] type="));
+  Serial.print(gHazardType);
+  Serial.print(F("  dir="));
+  Serial.print(gDirection);
+  Serial.print(F("  frontCount="));
+  Serial.print(gFrontCount);
+  Serial.print(F("/"));
+  Serial.println(FRONT_STABLE_COUNT);
+  Serial.println(F(""));
 }
 
 // ============================================================

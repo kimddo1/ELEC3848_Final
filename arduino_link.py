@@ -162,8 +162,9 @@ class ArduinoLink:
         arg = arg.strip()
 
         if cmd not in ("PLAY", "MODE", "SNAP"):
-            # Debug lines from Arduino — just print them
-            print(f"[Arduino] {line}")
+            # Pass through informational Arduino prints, suppress empty lines
+            if line.strip():
+                print(f"  [Arduino] {line}")
             return
 
         for handler in self._handlers:
@@ -180,13 +181,16 @@ def default_command_handler(cmd: str, arg: str):
     Handles commands sent from Arduino to Jetson.
     PLAY  → audio_player.play(arg)
     MODE  → log current Arduino mode
-    SNAP  → trigger snapshot_writer (Phase 7: replace stub with real save)
+    SNAP  → trigger snapshot_writer
     """
     if cmd == "PLAY":
+        print(f"  [Arduino→Jetson] PLAY:{arg}")
         audio_player.play(arg)
 
     elif cmd == "MODE":
-        print(f"[Arduino mode] {arg}")
+        print(f"\n{'─'*40}")
+        print(f"  [Arduino mode] {arg}")
+        print(f"{'─'*40}")
 
     elif cmd == "SNAP":
         snapshot_writer.save_current(arg)

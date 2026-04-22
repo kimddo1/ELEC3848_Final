@@ -5,18 +5,37 @@ import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 import time
+import signal
+import os
 from face_id import FaceIdentifier, draw_face_result
 from arduino_link import ArduinoLink, default_command_handler
 import snapshot_writer
+
+# ── graceful shutdown flag ────────────────────────────────────────────────────
+# SIGINT handler sets this; main loop checks it each frame instead of catching
+# KeyboardInterrupt, which does not reliably stop mid-CUDA operations.
+_shutdown = False
+
+def _request_shutdown(sig, frame):
+    global _shutdown
+    print("\n[Main] Shutdown requested — finishing current frame...")
+    _shutdown = True
+
+signal.signal(signal.SIGINT,  _request_shutdown)
+signal.signal(signal.SIGTERM, _request_shutdown)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ── config ───────────────────────────────────────────
 ENGINE_PATH = "/home/nvidia/Desktop/yolo11_jetson/yolo11n.engine"
 INPUT_W, INPUT_H = 320, 320
 CONF_THRESH = 0.5
 IOU_THRESH  = 0.45
-FACE_ID_EVERY_N_FRAMES = 8  # run face ID once every N frames to save GPU
+FACE_ID_EVERY_N_FRAMES = 8   # run face ID once every N frames to save GPU
+UNKNOWN_CONFIRM_COUNT  = 3   # consecutive "unknown" frames needed before FACE_UNKNOWN is sent
+ANNOUNCE_CONFIRM_FRAMES = 24 # consecutive active frames before PERSON_DETECTED is sent
+                              # = ~1 s at 24 FPS — ghost re-ID tracks die before reaching this
 PERSON_CLS  = 0          # COCO class 0 = person
-ARDUINO_PORT = "/dev/ttyUSB0"   # change to /dev/ttyACM0 if needed
+ARDUINO_PORT = "/dev/ttyUSB0"   # Arduino Mega (genuine): ttyACM0; CH340 clone: ttyUSB0
 
 GST_PIPELINE = (
     "nvarguscamerasrc ! "
@@ -236,37 +255,49 @@ def draw(frame, active_tracks, verified_ids, track_names):
     return frame
 
 
+def _send(link, msg, note=""):
+    """Send a Jetson event to Arduino and log it clearly."""
+    link.send(msg)
+    suffix = f"  ({note})" if note else ""
+    print(f"  [Jetson→Arduino] {msg}{suffix}")
+
+
 def main():
-    print("[1/3] Loading engine...")
+    print("Loading TRT engine...")
     engine  = load_engine(ENGINE_PATH)
     context = engine.create_execution_context()
     inputs, outputs, bindings, stream = allocate_buffers(engine)
+    print("Engine ready.")
 
     tracker     = PersonTracker(max_disappeared=45, match_iou=0.3)
     face_id     = FaceIdentifier()
-    track_names  = {}    # track_id -> verified person name
-    announced    = set() # track_ids for which PERSON_DETECTED was already sent
-    face_snapped = set() # track_ids for which a "face" snapshot was already saved
+    track_names        = {}    # track_id -> verified person name
+    announced          = set() # track_ids for which PERSON_DETECTED was sent
+    announce_count     = {}    # tid -> consecutive active frames (pre-announcement gate)
+    face_snapped       = set() # track_ids for which a "face" snapshot was saved
+    face_unknown_sent  = set() # track_ids for which FACE_UNKNOWN was sent
+    face_unknown_count = {}    # tid -> consecutive "unknown" frame count (debounce)
+    last_face_status   = {}    # tid -> last printed face status (suppress repeats)
 
     link = ArduinoLink(port=ARDUINO_PORT)
     link.register_command_handler(default_command_handler)
     link.start()
 
-    print("[2/3] Opening camera...")
+    print("Opening camera...")
     cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
         raise RuntimeError("Cannot open camera. Check GStreamer pipeline.")
 
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[3/3] Starting inference ({orig_w}x{orig_h})")
+    print(f"Camera open: {orig_w}x{orig_h}  |  Press Q to quit\n")
 
     prev_t   = time.time()
     frame_no = 0
-    while True:
+    while not _shutdown:
         ret, frame = cap.read()
         if not ret:
-            print("Failed to read frame")
+            print("Failed to read frame — camera disconnected?")
             break
 
         snapshot_writer.update_frame(frame)   # keep latest frame for SNAP: commands
@@ -285,19 +316,38 @@ def main():
         active_tracks = tracker.update(boxes)
 
         # ── serial: detect disappeared unverified tracks ────
-        vanished = announced - tracker.verified - set(active_tracks.keys())
+        # Use tracker.tracks (all IDs, including gone>0 ones still within max_disappeared)
+        # so a single missed frame does NOT trigger FACE_TIMEOUT prematurely.
+        all_track_ids = set(tracker.tracks.keys())
+
+        # Tracks that were announced but have now fully disappeared
+        vanished = announced - tracker.verified - all_track_ids
         for tid in vanished:
-            link.send("FACE_TIMEOUT")
+            _send(link, "FACE_TIMEOUT", f"track #{tid} left scene")
             snapshot_writer.log_event("FACE_TIMEOUT", tid, "", "")
             announced.discard(tid)
             face_snapped.discard(tid)
+            face_unknown_sent.discard(tid)
+            face_unknown_count.pop(tid, None)
+            last_face_status.pop(tid, None)
+
+        # Ghost re-ID tracks: pending announcement but already pruned by tracker
+        for tid in list(announce_count.keys()):
+            if tid not in all_track_ids:
+                announce_count.pop(tid, None)  # silently discard — never reached threshold
 
         # ── serial: announce new unverified tracks ──────────
+        # Require ANNOUNCE_CONFIRM_FRAMES consecutive active frames before sending
+        # PERSON_DETECTED — silently drops ghost re-ID tracks (a verified person's
+        # box briefly misses IoU match → new track ID, gone again next frame).
         for tid, box in active_tracks.items():
             if tid not in tracker.verified and tid not in announced:
-                link.send("PERSON_DETECTED")
-                announced.add(tid)
-                snapshot_writer.save(frame, box, "person", tid)
+                announce_count[tid] = announce_count.get(tid, 0) + 1
+                if announce_count[tid] >= ANNOUNCE_CONFIRM_FRAMES:
+                    _send(link, "PERSON_DETECTED", f"track #{tid}")
+                    announced.add(tid)
+                    announce_count.pop(tid, None)
+                    snapshot_writer.save(frame, box, "person", tid)
 
         # ── face identification (throttled) ────────
         if frame_no % FACE_ID_EVERY_N_FRAMES == 0:
@@ -309,17 +359,45 @@ def main():
                     snapshot_writer.save(frame, box, "face", tid)
                     face_snapped.add(tid)
 
-                if result["status"] == "verified":
+                status = result["status"]
+
+                # ── log face status only when it changes ──
+                if last_face_status.get(tid) != status:
+                    last_face_status[tid] = status
+                    if status == "verified":
+                        print(f"  Face #{tid}: VERIFIED → {result['name']}")
+                    elif status == "unknown":
+                        print(f"  Face #{tid}: unknown (not in database)")
+                    elif status == "no_face":
+                        print(f"  Face #{tid}: scanning — no face visible yet")
+                    elif status == "alert":
+                        print(f"  Face #{tid}: no face detected for 2 s")
+
+                if status == "verified":
                     tracker.mark_verified(tid)
                     track_names[tid] = result["name"]
-                    link.send(f"FACE_VERIFIED:{result['name']}")
+                    _send(link, f"FACE_VERIFIED:{result['name']}", f"track #{tid}")
                     announced.discard(tid)
+                    face_unknown_sent.discard(tid)
+                    face_unknown_count.pop(tid, None)
                     snapshot_writer.save(frame, box, "verified", tid, result["name"])
                     snapshot_writer.log_event("FACE_VERIFIED", tid, result["name"], "")
-                elif result["status"] == "alert":
-                    # face_id: no face detected for NO_FACE_TIMEOUT seconds
-                    link.send("FACE_UNKNOWN")
-                    snapshot_writer.log_event("FACE_UNKNOWN", tid, "", "")
+
+                elif status == "unknown" and tid not in face_unknown_sent:
+                    # Require UNKNOWN_CONFIRM_COUNT consecutive "unknown" frames before
+                    # declaring intruder — prevents a transient ArcFace miss from
+                    # triggering SECURITY_ALERT while the real owner is still in frame.
+                    face_unknown_count[tid] = face_unknown_count.get(tid, 0) + 1
+                    if face_unknown_count[tid] >= UNKNOWN_CONFIRM_COUNT:
+                        _send(link, "FACE_UNKNOWN", f"track #{tid}, {UNKNOWN_CONFIRM_COUNT} consecutive frames")
+                        face_unknown_sent.add(tid)
+                        snapshot_writer.log_event("FACE_UNKNOWN", tid, "", "")
+
+                else:
+                    # "no_face" or "alert" — reset unknown counter
+                    face_unknown_count.pop(tid, None)
+                    if status == "alert":
+                        snapshot_writer.log_event("FACE_ALERT_NO_FACE", tid, "", "")
         frame_no += 1
 
         # ── display ────────────────────────────────
@@ -335,10 +413,16 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    # ── cleanup ────────────────────────────────────────────────────────────────
+    print("[Main] Releasing camera...")
     cap.release()
     cv2.destroyAllWindows()
     face_id.close()
     link.stop()
+    print("[Main] Done.")
+    # os._exit bypasses pycuda.autoinit's CUDA context destructor which causes
+    # a core dump on Jetson when the process exits after a SIGINT mid-CUDA-op.
+    os._exit(0)
 
 
 if __name__ == "__main__":
