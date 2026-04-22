@@ -72,9 +72,13 @@ def stop():
 
 
 def _generate_verified(name: str, wav_path: str):
-    """Generate verified_<name>.wav at 48 kHz using pico2wave or espeak."""
+    """Generate verified_<name>.wav at 48 kHz using pico2wave or espeak.
+    name may be a compound like 'David_and_Alice' — underscores become spaces
+    so TTS speaks 'Identity verified. Welcome, David and Alice.'
+    """
     os.makedirs(AUDIO_DIR, exist_ok=True)
-    text = f"Identity verified. Welcome, {name}."
+    spoken_name = name.replace("_", " ")   # "David_and_Alice" → "David and Alice"
+    text = f"Identity verified. Welcome, {spoken_name}."
     tmp = wav_path + ".tmp.wav"
 
     if shutil.which("pico2wave") and shutil.which("sox"):

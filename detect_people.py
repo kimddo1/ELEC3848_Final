@@ -10,6 +10,7 @@ import os
 from face_id import FaceIdentifier, draw_face_result
 from arduino_link import ArduinoLink, default_command_handler
 import snapshot_writer
+import audio_player
 
 # ── graceful shutdown flag ────────────────────────────────────────────────────
 # SIGINT handler sets this; main loop checks it each frame instead of catching
@@ -272,12 +273,14 @@ def main():
     tracker     = PersonTracker(max_disappeared=45, match_iou=0.3)
     face_id     = FaceIdentifier()
     track_names        = {}    # track_id -> verified person name
-    announced          = set() # track_ids for which PERSON_DETECTED was sent
-    announce_count     = {}    # tid -> consecutive active frames (pre-announcement gate)
+    announced          = set() # track_ids that passed the 24-frame gate
+    announce_count     = {}    # tid -> consecutive active frames (pre-gate)
     face_snapped       = set() # track_ids for which a "face" snapshot was saved
-    face_unknown_sent  = set() # track_ids for which FACE_UNKNOWN was sent
+    confirmed_unknown  = set() # track_ids confirmed not-in-DB (>= UNKNOWN_CONFIRM_COUNT frames)
     face_unknown_count = {}    # tid -> consecutive "unknown" frame count (debounce)
+    verified_played    = set() # track_ids for which verified audio was triggered (one-shot)
     last_face_status   = {}    # tid -> last printed face status (suppress repeats)
+    last_status        = ""    # last STATUS payload — only print when it changes
 
     link = ArduinoLink(port=ARDUINO_PORT)
     link.register_command_handler(default_command_handler)
@@ -315,53 +318,63 @@ def main():
         # ── tracking ───────────────────────────────
         active_tracks = tracker.update(boxes)
 
-        # ── serial: detect disappeared unverified tracks ────
-        # Use tracker.tracks (all IDs, including gone>0 ones still within max_disappeared)
-        # so a single missed frame does NOT trigger FACE_TIMEOUT prematurely.
+        # ── clean up fully-pruned tracks ────────────────────────────────────────
+        # tracker.tracks holds all IDs until gone > max_disappeared (45 frames).
+        # When a track disappears entirely, clean up Jetson state.
+        # Critically: if the track was still SCANNING when it left (not verified,
+        # not confirmed unknown), send FACE_TIMEOUT to Arduino immediately.
+        # This event is queued BEFORE the next STATUS packet, so Arduino receives
+        # the alert before seeing a STATUS where that track is simply absent.
         all_track_ids = set(tracker.tracks.keys())
+        for tid in list(announced):
+            if tid not in all_track_ids:
+                if tid not in tracker.verified and tid not in confirmed_unknown:
+                    # Unresolved departure — person left while still being scanned
+                    link.send("FACE_TIMEOUT")
+                    print(f"  [Jetson→Arduino] FACE_TIMEOUT  (track #{tid} left unverified)")
+                    snapshot_writer.log_event("FACE_TIMEOUT", tid, "", "")
+                announced.discard(tid)
+                confirmed_unknown.discard(tid)
+                face_snapped.discard(tid)
+                face_unknown_count.pop(tid, None)
+                verified_played.discard(tid)
+                last_face_status.pop(tid, None)
+                print(f"  [Track #{tid}] left scene — removed from tracking")
 
-        # Tracks that were announced but have now fully disappeared
-        vanished = announced - tracker.verified - all_track_ids
-        for tid in vanished:
-            _send(link, "FACE_TIMEOUT", f"track #{tid} left scene")
-            snapshot_writer.log_event("FACE_TIMEOUT", tid, "", "")
-            announced.discard(tid)
-            face_snapped.discard(tid)
-            face_unknown_sent.discard(tid)
-            face_unknown_count.pop(tid, None)
-            last_face_status.pop(tid, None)
-
-        # Ghost re-ID tracks: pending announcement but already pruned by tracker
+        # Ghost re-ID tracks: still accumulating announce_count but already pruned
         for tid in list(announce_count.keys()):
             if tid not in all_track_ids:
-                announce_count.pop(tid, None)  # silently discard — never reached threshold
+                announce_count.pop(tid, None)
 
-        # ── serial: announce new unverified tracks ──────────
-        # Require ANNOUNCE_CONFIRM_FRAMES consecutive active frames before sending
-        # PERSON_DETECTED — silently drops ghost re-ID tracks (a verified person's
-        # box briefly misses IoU match → new track ID, gone again next frame).
+        # ── announce gate — 24 consecutive active frames before tracking ─────────
+        # Silently drops ghost re-ID tracks (verified person's box briefly misses
+        # IoU → new track ID that vanishes the next frame).
         for tid, box in active_tracks.items():
-            if tid not in tracker.verified and tid not in announced:
+            if tid not in announced and tid not in tracker.verified:
                 announce_count[tid] = announce_count.get(tid, 0) + 1
                 if announce_count[tid] >= ANNOUNCE_CONFIRM_FRAMES:
-                    _send(link, "PERSON_DETECTED", f"track #{tid}")
                     announced.add(tid)
                     announce_count.pop(tid, None)
                     snapshot_writer.save(frame, box, "person", tid)
+                    # Play N-detected audio directly — Jetson has the count,
+                    # Arduino does not.  Arduino's enterVerification() no longer
+                    # plays detected_person; Jetson handles all count announcements.
+                    n = len(announced)
+                    clip = "detected_person" if n == 1 else f"{n}_detected"
+                    audio_player.play(clip)
+                    print(f"  [Track #{tid}] confirmed — {n} person(s) on screen")
 
-        # ── face identification (throttled) ────────
+        # ── face identification (throttled) ──────────────────────────────────────
         if frame_no % FACE_ID_EVERY_N_FRAMES == 0:
             for tid, box in tracker.get_unverified_tracks():
                 result = face_id.identify(frame, box, track_id=tid)
                 frame  = draw_face_result(frame, result)
-                # ── face snapshot (first time a face is found in this track) ──
+
                 if result["status"] in ("verified", "unknown") and tid not in face_snapped:
                     snapshot_writer.save(frame, box, "face", tid)
                     face_snapped.add(tid)
 
                 status = result["status"]
-
-                # ── log face status only when it changes ──
                 if last_face_status.get(tid) != status:
                     last_face_status[tid] = status
                     if status == "verified":
@@ -376,28 +389,43 @@ def main():
                 if status == "verified":
                     tracker.mark_verified(tid)
                     track_names[tid] = result["name"]
-                    _send(link, f"FACE_VERIFIED:{result['name']}", f"track #{tid}")
-                    announced.discard(tid)
-                    face_unknown_sent.discard(tid)
                     face_unknown_count.pop(tid, None)
-                    snapshot_writer.save(frame, box, "verified", tid, result["name"])
-                    snapshot_writer.log_event("FACE_VERIFIED", tid, result["name"], "")
+                    if tid not in verified_played:
+                        verified_played.add(tid)
+                        snapshot_writer.save(frame, box, "verified", tid, result["name"])
+                        snapshot_writer.log_event("FACE_VERIFIED", tid, result["name"], "")
 
-                elif status == "unknown" and tid not in face_unknown_sent:
-                    # Require UNKNOWN_CONFIRM_COUNT consecutive "unknown" frames before
-                    # declaring intruder — prevents a transient ArcFace miss from
-                    # triggering SECURITY_ALERT while the real owner is still in frame.
+                elif status == "unknown":
                     face_unknown_count[tid] = face_unknown_count.get(tid, 0) + 1
                     if face_unknown_count[tid] >= UNKNOWN_CONFIRM_COUNT:
-                        _send(link, "FACE_UNKNOWN", f"track #{tid}, {UNKNOWN_CONFIRM_COUNT} consecutive frames")
-                        face_unknown_sent.add(tid)
-                        snapshot_writer.log_event("FACE_UNKNOWN", tid, "", "")
+                        if tid not in confirmed_unknown:
+                            confirmed_unknown.add(tid)
+                            snapshot_writer.log_event("FACE_UNKNOWN", tid, "", "")
 
                 else:
-                    # "no_face" or "alert" — reset unknown counter
                     face_unknown_count.pop(tid, None)
                     if status == "alert":
                         snapshot_writer.log_event("FACE_ALERT_NO_FACE", tid, "", "")
+
+            # ── build and send STATUS packet ──────────────────────────────────────
+            # One packet per face-ID cycle (~3x/sec at 24 FPS).
+            # Covers only tracks that have passed the announce gate (announced set).
+            # Arduino reads this and decides mode transitions — no individual events.
+            entries = []
+            for tid in sorted(announced):
+                if tid in tracker.verified:
+                    entries.append(f"T{tid}:VERIFIED:{track_names.get(tid, '?')}")
+                elif tid in confirmed_unknown:
+                    entries.append(f"T{tid}:UNKNOWN")
+                else:
+                    entries.append(f"T{tid}:SCANNING")
+
+            payload = ",".join(entries) if entries else "CLEAR"
+            link.send(f"STATUS:{payload}")
+            if payload != last_status:
+                last_status = payload
+                print(f"  [Jetson→Arduino] STATUS:{payload}")
+
         frame_no += 1
 
         # ── display ────────────────────────────────
