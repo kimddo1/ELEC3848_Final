@@ -25,7 +25,7 @@ const uint8_t NUM_LEDS = 24;     // change if your panel has different count
 const uint8_t LED_BRIGHTNESS = 96;
 
 const uint8_t SERVO_PIN = 39;
-const int SERVO_CENTER_DEG = 90;
+const int SERVO_CENTER_DEG = 100;
 const int SERVO_CLOCKWISE_DEG = 140;
 const int SERVO_STEP_DEG = 2;
 const int SERVO_STEP_DELAY_MS = 55;
@@ -202,9 +202,15 @@ const char* gDirection = "NONE";
 const char* gHazardType = "NONE";
 
 // Mode state
-RobotMode      gMode            = MODE_PATROL;
-unsigned long  gModeStartMs     = 0;
-bool           gVerifServoScanned = false;
+RobotMode      gMode               = MODE_PATROL;
+RobotMode      gPreFireMode        = MODE_PATROL;  // mode to resume after fire alert
+unsigned long  gModeStartMs        = 0;
+bool           gVerifServoScanned  = false;
+// Set true when STATUS shows at least one :SCANNING track.
+// Cleared when all resolve to VERIFIED (clean exit) or we enter security alert.
+// Used to distinguish "all clean, scene emptied" (→ patrol) from
+// "someone left without being identified" (→ security alert) when STATUS:CLEAR arrives.
+bool           gVerifPendingResolution = false;
 PatrolSubState gPatrolSub       = PSUB_FORWARD;
 unsigned long  gPatrolTurnStartMs = 0;
 
@@ -226,6 +232,9 @@ void printHelp();
 void printSnapshot();
 void printHazardTrigger();
 void dispatchSingleChar(char cmd);
+void playVerifiedNames(const char* payload);
+void handleStatusPacket(const char* payload);
+void resumeVerification();
 void dispatchJetsonLine(const char* line);
 void handleSerial();
 
@@ -267,6 +276,12 @@ void rotateNinetyDegreesLeft();
 void btSend(const char* msg);
 void btSendFireAlert();
 void btSendSecurityAlert();
+
+// Hazard-interruptible delay used inside the servo scan blocking section.
+// Polls sensors every 20 ms; if fire/gas is detected, calls enterFireAlert()
+// and returns true so the caller can immediately return out of runVerification().
+// Returns false if the full duration elapsed without any hazard.
+bool waitOrFireAlert(unsigned long ms);
 
 // Mode state machine
 void enterPatrol();
@@ -357,7 +372,7 @@ void centerServo()
 {
   testServo.write(SERVO_CENTER_DEG);
   delay(350);
-  Serial.println(F("[SERVO] centered at 90 deg on D39"));
+  Serial.println(F("[SERVO] centered at 100 deg on D39"));
 }
 
 void runServoSweep()
@@ -837,6 +852,7 @@ void btSendSecurityAlert()
 
 void enterPatrol()
 {
+  gVerifPendingResolution = false;
   gMode = MODE_PATROL;
   gModeStartMs = millis();
   gPatrolSub = PSUB_FORWARD;
@@ -850,6 +866,7 @@ void enterPatrol()
 
 void enterFireAlert()
 {
+  gPreFireMode = gMode;  // remember where we came from so runFireAlert() can resume correctly
   gMode = MODE_FIRE_ALERT;
   gModeStartMs = millis();
   stopMotors();
@@ -867,6 +884,7 @@ void enterFireAlert()
 
 void enterVerification()
 {
+  gVerifPendingResolution = false;  // fresh session — will be set true on first SCANNING packet
   gMode = MODE_VERIFICATION;
   gModeStartMs = millis();
   gVerifServoScanned = false;
@@ -879,11 +897,13 @@ void enterVerification()
   drawVerificationOled();
   Serial.println(F("[MODE] VERIFICATION"));
   Serial.println(F("MODE:VERIFICATION"));
-  Serial.println(F("PLAY:detected_person"));
+  // N-detected audio is now played by Jetson (detect_people.py) when the track
+  // enters the announce gate — Jetson knows the exact person count at that moment.
 }
 
 void enterSecurityAlert()
 {
+  gVerifPendingResolution = false;
   gMode = MODE_SECURITY_ALERT;
   gModeStartMs = millis();
   stopMotors();
@@ -965,12 +985,56 @@ void runFireAlert()
   if (nowMs - gModeStartMs >= FIRE_ALERT_DURATION_MS)
   {
     noTone(BUZZER_PIN);
-    enterPatrol();
+    if (gPreFireMode == MODE_VERIFICATION)
+    {
+      // Fire interrupted an active verification.
+      // resumeVerification() skips the announcement + servo scan (already done)
+      // and just waits for Jetson STATUS response with a fresh timeout window.
+      // If the person left during the fire alert, the next STATUS:CLEAR will
+      // trigger security alert because gVerifPendingResolution is still true.
+      resumeVerification();
+    }
+    else
+    {
+      enterPatrol();
+    }
   }
+}
+
+// Waits up to `ms` milliseconds, polling hazard sensors every 20 ms.
+// If a hazard is detected during the wait, immediately calls enterFireAlert()
+// (which saves gPreFireMode = MODE_VERIFICATION) and returns true.
+// The caller should do:  if (waitOrFireAlert(N)) return;
+bool waitOrFireAlert(unsigned long ms)
+{
+  const unsigned long end = millis() + ms;
+  while (millis() < end)
+  {
+    updateHazardState(false);   // rate-limited to HAZARD_SAMPLE_INTERVAL_MS internally
+    if (gHazardDetected)
+    {
+      Serial.println(F("[VERIF] hazard detected during scan — entering fire alert"));
+      enterFireAlert();
+      return true;
+    }
+    delay(20);
+  }
+  return false;
 }
 
 void runVerification()
 {
+  // Fire / gas takes absolute priority — interrupt verification, alert, then resume.
+  // gPreFireMode is set to MODE_VERIFICATION inside enterFireAlert() so that
+  // runFireAlert() knows to call enterVerification() instead of enterPatrol()
+  // when the alert finishes.
+  if (gHazardDetected)
+  {
+    Serial.println(F("[VERIF] hazard detected — suspending verification for fire alert"));
+    enterFireAlert();
+    return;
+  }
+
   const unsigned long nowMs = millis();
   const unsigned long elapsed = nowMs - gModeStartMs;
 
@@ -980,23 +1044,29 @@ void runVerification()
     gVerifServoScanned = true;
 
     // 1. Red LED + play audio, then wait for clip to finish
+    //    waitOrFireAlert() polls sensors every 20 ms — fire overrides immediately.
     setStatusLed(CRGB::Red);
     Serial.println(F("PLAY:approach_camera"));
-    delay(VERIF_AUDIO_WAIT_MS);
+    if (waitOrFireAlert(VERIF_AUDIO_WAIT_MS)) return;
 
-    // 2. Sweep servo slowly from 90° to 130°
+    // 2. Sweep servo slowly from center to VERIF_SERVO_MAX_DEG
     for (int a = SERVO_CENTER_DEG; a <= VERIF_SERVO_MAX_DEG; a += SERVO_STEP_DEG)
     {
       testServo.write(a);
-      delay(SERVO_STEP_DELAY_MS);
+      if (waitOrFireAlert(SERVO_STEP_DELAY_MS)) return;
     }
 
-    // 3. At 130°: white LED, hold 3 s
+    // 3. At max angle: white LED, hold 3 s
     setStatusLed(CRGB::White);
-    delay(VERIF_SERVO_HOLD_MS);
+    if (waitOrFireAlert(VERIF_SERVO_HOLD_MS)) return;
 
-    // 4. Return servo to 90°
-    centerServo();
+    // 4. Return servo slowly to center — same step rate as the forward sweep
+    for (int a = VERIF_SERVO_MAX_DEG; a >= SERVO_CENTER_DEG; a -= SERVO_STEP_DEG)
+    {
+      testServo.write(a);
+      if (waitOrFireAlert(SERVO_STEP_DELAY_MS)) return;
+    }
+    if (waitOrFireAlert(150)) return;  // brief settle at center
 
     // 5. Flush serial buffer — FACE_VERIFIED may have arrived during the
     //    blocking delays above and is waiting to be read.
@@ -1253,8 +1323,179 @@ void printHazardTrigger()
 // commands and multi-token Jetson event strings.
 // ============================================================
 
-static char  sLineBuf[80];
+static char  sLineBuf[128];   // enlarged: STATUS packets can be ~80 chars
 static uint8_t sLineLen = 0;
+
+// ── playVerifiedNames ──────────────────────────────────────────────────────────
+// Scans a STATUS payload for ":VERIFIED:<name>" tokens and sends PLAY:verified_<name>
+// to Jetson for each one found.  Called once when transitioning out of VERIFICATION
+// because all persons are confirmed clean.
+void playVerifiedNames(const char* payload)
+{
+  // Collect up to 4 verified names from the STATUS payload.
+  char names[4][32];
+  int nameCount = 0;
+
+  const char* p = payload;
+  while ((p = strstr(p, ":VERIFIED:")) != NULL && nameCount < 4)
+  {
+    p += 10;  // skip ":VERIFIED:"
+    uint8_t i = 0;
+    while (*p && *p != ',' && i < 31)
+    {
+      names[nameCount][i++] = *p++;
+    }
+    names[nameCount][i] = '\0';
+    if (i > 0) nameCount++;
+  }
+
+  if (nameCount == 0) return;
+
+  if (nameCount == 1)
+  {
+    // Single person: "PLAY:verified_David"
+    // Jetson generates: "Identity verified. Welcome, David."
+    Serial.print(F("PLAY:verified_"));
+    Serial.println(names[0]);
+  }
+  else
+  {
+    // Multiple people: "PLAY:verified_David_and_Alice"
+    // Jetson audio_player converts underscores → spaces for TTS:
+    //   "Identity verified. Welcome, David and Alice."
+    char clip[96];
+    strcpy(clip, "PLAY:verified_");
+    for (int i = 0; i < nameCount; i++)
+    {
+      if (i > 0) strcat(clip, "_and_");
+      strncat(clip, names[i], sizeof(clip) - strlen(clip) - 1);
+    }
+    Serial.println(clip);
+  }
+}
+
+// ── resumeVerification ────────────────────────────────────────────────────────
+// Called when fire alert interrupted an active verification and has now ended.
+// Unlike enterVerification(), this does NOT replay the announcement audio,
+// reset the servo scan flag, or restart the 6-second pre-scan timer.
+// It simply restores the orange LED / OLED and resets the post-scan timeout
+// so Arduino waits a fresh VERIF_TIMEOUT_MS window for Jetson STATUS responses.
+//
+// gVerifPendingResolution is deliberately NOT reset here — it was set true
+// before the fire (someone was SCANNING) and that state is still true now.
+// If Jetson sends CLEAR (person left during fire) → security alert ("ran away").
+void resumeVerification()
+{
+  gMode = MODE_VERIFICATION;
+  gModeStartMs = millis();         // fresh post-scan timeout window
+  gVerifServoScanned = true;       // scan already done before fire — do not repeat it
+  stopMotors();
+  testServo.attach(SERVO_PIN);     // re-attach after fire-alert detach
+  centerServo();                   // restore to 100° (may have drifted while detached)
+  noTone(BUZZER_PIN);
+  setStatusLed(CRGB(255, 80, 0)); // orange — scanning state
+  drawVerificationOled();
+  Serial.println(F("[MODE] VERIFICATION (resumed after fire alert)"));
+  Serial.println(F("MODE:VERIFICATION"));
+}
+
+// ── handleStatusPacket ────────────────────────────────────────────────────────
+// Called with the payload portion of a STATUS: line from Jetson.
+// Examples: "CLEAR"
+//           "T0:SCANNING"
+//           "T0:VERIFIED:David,T1:UNKNOWN"
+//           "T0:VERIFIED:David,T1:VERIFIED:Alice"
+//
+// Decision rules (Arduino is the brain — reads full context, decides mode):
+//   Any :UNKNOWN  → enterSecurityAlert() immediately (one intruder = alert)
+//   Any :SCANNING → enterVerification() from PATROL, or reset timeout in VERIFICATION
+//   All :VERIFIED or CLEAR → enterPatrol() if was verifying
+//   FIRE_ALERT / SECURITY_ALERT → STATUS ignored (those modes are time-based)
+void handleStatusPacket(const char* payload)
+{
+  // ── CLEAR: nobody in the announced set ───────────────────────────────────
+  if (strcmp(payload, "CLEAR") == 0)
+  {
+    if (gMode == MODE_VERIFICATION)
+    {
+      if (gVerifPendingResolution)
+      {
+        // At least one person was SCANNING and has now disappeared from the
+        // scene without being identified — treat as intruder who ran away.
+        // This also covers: person left while fire alert was active.
+        Serial.println(F("[STATUS] CLEAR — unverified person left scene → INTRUDER"));
+        enterSecurityAlert();
+      }
+      else
+      {
+        // All persons were VERIFIED before the scene went empty — clean exit.
+        Serial.println(F("[STATUS] CLEAR — all persons verified, returning to patrol"));
+        enterPatrol();
+      }
+    }
+    return;
+  }
+
+  // ── scan payload for status tokens ───────────────────────────────────────
+  const bool anyUnknown  = strstr(payload, ":UNKNOWN")  != NULL;
+  const bool anyScanning = strstr(payload, ":SCANNING") != NULL;
+  // If neither flag is set, all entries must be :VERIFIED:name
+
+  Serial.print(F("[STATUS] "));
+  Serial.println(payload);
+
+  switch (gMode)
+  {
+    // ── PATROL ─────────────────────────────────────────────────────────────
+    case MODE_PATROL:
+      if (anyUnknown)
+      {
+        // Edge case: intruder confirmed before patrol had time to enter VERIFICATION
+        enterSecurityAlert();
+      }
+      else if (anyScanning)
+      {
+        enterVerification();
+      }
+      // All VERIFIED while in PATROL: nothing to do (already clean)
+      break;
+
+    // ── VERIFICATION ───────────────────────────────────────────────────────
+    case MODE_VERIFICATION:
+      if (anyUnknown)
+      {
+        // Any intruder → immediate alert, regardless of how many others are verified
+        enterSecurityAlert();
+      }
+      else if (anyScanning)
+      {
+        // At least one person still unresolved — remember this so CLEAR later
+        // triggers security alert rather than patrol.
+        gVerifPendingResolution = true;
+        // Reset post-scan timeout so people get a full window to be identified.
+        if (gVerifServoScanned)
+        {
+          gModeStartMs = millis();
+        }
+      }
+      else
+      {
+        // No SCANNING, no UNKNOWN → all announced persons are VERIFIED
+        gVerifPendingResolution = false;  // clean exit — disarm the CLEAR→alert trigger
+        playVerifiedNames(payload);
+        setStatusLed(CRGB::Green);
+        delay(800);
+        enterPatrol();
+      }
+      break;
+
+    // ── FIRE_ALERT / SECURITY_ALERT ────────────────────────────────────────
+    case MODE_FIRE_ALERT:
+    case MODE_SECURITY_ALERT:
+      // These modes run to their timed conclusion — STATUS does not interrupt them
+      break;
+  }
+}
 
 void dispatchSingleChar(char cmd)
 {
@@ -1309,66 +1550,46 @@ void dispatchSingleChar(char cmd)
 
 void dispatchJetsonLine(const char* line)
 {
-  // ── PERSON_DETECTED ────────────────────────────────────────
-  if (strcmp(line, "PERSON_DETECTED") == 0)
+  // ── STATUS:<payload> ───────────────────────────────────────────────────────
+  // Primary data channel. Jetson sends one packet per face-ID cycle (~3 Hz)
+  // containing the full verification state of all tracked persons.
+  // handleStatusPacket() reads the full context and decides mode transitions.
+  if (strncmp(line, "STATUS:", 7) == 0)
   {
-    Serial.println(F("[JETSON] PERSON_DETECTED"));
-    if (gMode == MODE_PATROL)
-    {
-      enterVerification();
-    }
+    handleStatusPacket(line + 7);
+    return;
   }
 
-  // ── FACE_VERIFIED:<name> ───────────────────────────────────
-  else if (strncmp(line, "FACE_VERIFIED:", 14) == 0)
+  // ── FACE_TIMEOUT ───────────────────────────────────────────────────────────
+  // Sent by Jetson when a track that was still SCANNING (not verified, not
+  // confirmed unknown) is fully pruned from the tracker — i.e. the person left
+  // the camera frame without being identified.
+  // Arrives in the serial queue BEFORE the STATUS packet that would otherwise
+  // show "all VERIFIED" (with the departed track simply absent), so Arduino
+  // correctly treats the departure as an intruder running away.
+  if (strcmp(line, "FACE_TIMEOUT") == 0)
   {
-    const char* name = line + 14;
-    Serial.print(F("[JETSON] FACE_VERIFIED: "));
-    Serial.println(name);
-    if (gMode == MODE_VERIFICATION)
-    {
-      noTone(BUZZER_PIN);
-      setStatusLed(CRGB::Green);
-      Serial.print(F("PLAY:verified_"));
-      Serial.println(name);
-      delay(1000);
-      enterPatrol();
-    }
-  }
-
-  // ── FACE_UNKNOWN ───────────────────────────────────────────
-  else if (strcmp(line, "FACE_UNKNOWN") == 0)
-  {
-    Serial.println(F("[JETSON] FACE_UNKNOWN"));
+    Serial.println(F("[JETSON] FACE_TIMEOUT — unverified person left scene"));
     if (gMode == MODE_VERIFICATION)
     {
       enterSecurityAlert();
     }
+    return;
   }
 
-  // ── FACE_TIMEOUT ───────────────────────────────────────────
-  else if (strcmp(line, "FACE_TIMEOUT") == 0)
+  // ── HEARTBEAT ──────────────────────────────────────────────────────────────
+  // Keep-alive from Jetson ArduinoLink background thread. STATUS:CLEAR serves
+  // the same purpose when no persons are tracked, but HEARTBEAT is kept as a
+  // belt-and-suspenders link-alive signal.
+  if (strcmp(line, "HEARTBEAT") == 0)
   {
-    Serial.println(F("[JETSON] FACE_TIMEOUT"));
-    if (gMode == MODE_VERIFICATION)
-    {
-      enterSecurityAlert();
-    }
+    // silently acknowledge
+    return;
   }
 
-  // ── HEARTBEAT ──────────────────────────────────────────────
-  else if (strcmp(line, "HEARTBEAT") == 0)
-  {
-    // silently acknowledge — uncomment next line to debug:
-    // Serial.println(F("[JETSON] HEARTBEAT"));
-  }
-
-  // ── unknown ────────────────────────────────────────────────
-  else
-  {
-    Serial.print(F("[SERIAL] unknown: "));
-    Serial.println(line);
-  }
+  // ── unknown ────────────────────────────────────────────────────────────────
+  Serial.print(F("[SERIAL] unknown: "));
+  Serial.println(line);
 }
 
 void handleSerial()
