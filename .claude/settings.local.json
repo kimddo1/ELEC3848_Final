@@ -3,7 +3,11 @@
     "allow": [
       "WebFetch(domain:github.com)",
       "Bash(gh pr *)",
-      "Bash(brew list *)"
+      "Bash(brew list *)",
+      "Bash(afconvert --help)",
+      "Bash(say -v 'Samantha' \"test\")",
+      "Bash(say -v 'Alex' \"test\")",
+      "Bash(afinfo \"/Users/M1/Documents/HKU 2.2/ELEC_3848/Group Project/Final/audio/alert_fire.wav\")"
     ]
   }
 }

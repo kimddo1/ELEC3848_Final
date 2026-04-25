@@ -5,6 +5,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ctype.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================
@@ -55,7 +56,13 @@ const unsigned long STOP_SETTLE_MS   = 150UL;
 // Front ultrasonic for patrol (U4)
 const uint8_t PATROL_FRONT_TRIG = 30;  // PC7 / D30
 const uint8_t PATROL_FRONT_ECHO = 29;  // PA7 / D29
+const uint8_t PATROL_LEFT_TRIG  = 33;  // PC4 / D33
+const uint8_t PATROL_LEFT_ECHO  = 32;  // PC5 / D32
+const uint8_t PATROL_RIGHT_TRIG = 28;  // PA6 / D28
+const uint8_t PATROL_RIGHT_ECHO = 25;  // PA3 / D25
 const float   FRONT_WALL_STOP_CM = 25.0f;
+const float   FRONT_WALL_SLOW_CM = 35.0f;  // slow zone: between this and STOP
+const int     PWM_SLOW_FORWARD   = 24;     // crawl speed in slow zone
 
 // ============================================================
 // Bluetooth remote link (HC-05 on Serial3)
@@ -69,11 +76,20 @@ const unsigned long BT_BAUD = 9600UL;
 // ============================================================
 const unsigned long FIRE_ALERT_DURATION_MS     = 10000UL;
 const unsigned long SECURITY_ALERT_DURATION_MS = 10000UL;
+const unsigned long VERIFIED_PAUSE_MS          = 2000UL;
 const unsigned long VERIF_TIMEOUT_MS           = 8000UL;  // fresh window after scan
 const unsigned long VERIF_SERVO_TRIGGER_MS     = 6000UL;  // +3 s gap so detected_person.wav finishes before approach_camera.wav starts
 const unsigned long VERIF_AUDIO_WAIT_MS        = 3000UL;  // approach_camera.wav duration
 const unsigned long VERIF_SERVO_HOLD_MS        = 3000UL;  // hold at 130° with white LED
 const int           VERIF_SERVO_MAX_DEG        = 130;
+const int           PWM_FIRE_TURN              = 38;
+const unsigned long FIRE_PRE_SETTLE_MS         = 500UL;
+const unsigned long FIRE_SNAPSHOT_SETTLE_MS    = 1000UL;
+const unsigned long FIRE_POST_SNAPSHOT_MS      = 2000UL;
+const unsigned long FIRE_CLEAR_STABLE_MS       = 700UL;
+const unsigned long FIRE_TURN_LEFT_90_MS       = 3600UL;
+const unsigned long FIRE_TURN_RIGHT_90_MS      = 3800UL;
+const unsigned long FIRE_TURN_RIGHT_180_MS     = 7400UL;
 
 // ============================================================
 // OLED config (friend's code logic reflected)
@@ -167,8 +183,31 @@ enum DualSensorIndex
 // ============================================================
 // Robot mode + motor struct
 // ============================================================
-enum RobotMode { MODE_PATROL, MODE_FIRE_ALERT, MODE_VERIFICATION, MODE_SECURITY_ALERT };
-enum PatrolSubState { PSUB_FORWARD, PSUB_TURNING };
+enum RobotMode {
+  MODE_PATROL,
+  MODE_FIRE_ALERT,
+  MODE_VERIFICATION,
+  MODE_SECURITY_ALERT,
+  MODE_VERIFIED_PAUSE,
+  MODE_EMERGENCY_STOP,
+  MODE_MANUAL_DRIVE
+};
+enum PatrolSubState {
+  PSUB_FORWARD,
+  PSUB_SLOW,
+  PSUB_PRE_TURN_SETTLE,
+  PSUB_TURNING,
+  PSUB_POST_TURN_SETTLE
+};
+enum FireTurn  { FIRETURN_NONE, FIRETURN_LEFT90, FIRETURN_RIGHT90, FIRETURN_RIGHT180 };
+enum FireStage {
+  FIRESTAGE_PRE_SETTLE,
+  FIRESTAGE_ORIENTING,
+  FIRESTAGE_HOLDING,
+  FIRESTAGE_SNAPSHOT_WAIT,
+  FIRESTAGE_RESTORING,
+  FIRESTAGE_CLEAR_WAIT
+};
 
 struct MotorPins { uint8_t pwm; uint8_t in1; uint8_t in2; };
 const MotorPins MOTORS[4] = {
@@ -213,6 +252,15 @@ bool           gVerifServoScanned  = false;
 bool           gVerifPendingResolution = false;
 PatrolSubState gPatrolSub       = PSUB_FORWARD;
 unsigned long  gPatrolTurnStartMs = 0;
+unsigned long  gPatrolSettleStartMs = 0;
+bool           gPatrolTurnLeft = false;
+FireTurn       gFireTurn          = FIRETURN_NONE;
+FireStage      gFireStage         = FIRESTAGE_PRE_SETTLE;
+unsigned long  gFireStageStartMs  = 0;
+bool           gFireSnapshotSent  = false;
+bool           gFireClearCandidate = false;
+unsigned long  gFireClearStartMs  = 0;
+unsigned long  gManualMotionEndMs = 0;
 
 // ============================================================
 // Function declarations
@@ -256,6 +304,8 @@ void drawNormalOled();
 void drawAlertOled(bool visible);
 void drawVerificationOled();
 void drawSecurityAlertOled(bool visible);
+void drawVerifiedOled(const char* name);
+void drawEmergencyStopOled();
 
 // Motors
 void setupMotorPins();
@@ -271,6 +321,15 @@ void rotateRight(int pwm);
 void stopMotors();
 void rotateNinetyDegreesRight();
 void rotateNinetyDegreesLeft();
+
+// Patrol / fire helpers
+void choosePatrolTurnDirection();
+FireTurn chooseFireTurn(const char* direction);
+FireTurn inverseFireTurn(FireTurn turn);
+unsigned long fireTurnDurationMs(FireTurn turn);
+void startFireTurn(FireTurn turn);
+bool buildVerifiedDisplayNames(const char* payload, char* dest, size_t destSize);
+unsigned long parseManualDurationMs(const char* arg);
 
 // Bluetooth remote link
 void btSend(const char* msg);
@@ -288,10 +347,16 @@ void enterPatrol();
 void enterFireAlert();
 void enterVerification();
 void enterSecurityAlert();
+void enterVerifiedPause(const char* names);
+void enterEmergencyStop();
+void enterManualDrive();
 void runPatrol();
 void runFireAlert();
 void runVerification();
 void runSecurityAlert();
+void runVerifiedPause();
+void runEmergencyStop();
+void runManualDrive();
 void runCurrentMode();
 
 // ============================================================
@@ -481,6 +546,158 @@ void rotateNinetyDegreesLeft()
   delay(TURN_LEFT_90_MS);
   stopMotors();
   delay(STOP_SETTLE_MS);
+}
+
+void choosePatrolTurnDirection()
+{
+  const float leftCm = readDistanceMedian(PATROL_LEFT_TRIG, PATROL_LEFT_ECHO);
+  const float rightCm = readDistanceMedian(PATROL_RIGHT_TRIG, PATROL_RIGHT_ECHO);
+  const bool leftValid = leftCm > 0.0f;
+  const bool rightValid = rightCm > 0.0f;
+
+  gPatrolTurnLeft = false;  // default to right if both sides are unclear
+  if (leftValid && rightValid)
+  {
+    gPatrolTurnLeft = leftCm > rightCm;
+  }
+  else if (leftValid && !rightValid)
+  {
+    gPatrolTurnLeft = true;
+  }
+
+  Serial.print(F("[NAV] obstacle: left="));
+  if (leftValid) Serial.print(leftCm, 1); else Serial.print(F("NO_ECHO"));
+  Serial.print(F(" right="));
+  if (rightValid) Serial.print(rightCm, 1); else Serial.print(F("NO_ECHO"));
+  Serial.print(F(" -> turn "));
+  Serial.println(gPatrolTurnLeft ? F("LEFT") : F("RIGHT"));
+}
+
+FireTurn chooseFireTurn(const char* direction)
+{
+  if (!direction) return FIRETURN_NONE;
+  if (strcmp(direction, "LEFT") == 0 || strcmp(direction, "LEFT_REAR") == 0)
+  {
+    return FIRETURN_LEFT90;
+  }
+  if (strcmp(direction, "RIGHT") == 0 || strcmp(direction, "RIGHT_REAR") == 0)
+  {
+    return FIRETURN_RIGHT90;
+  }
+  if (strcmp(direction, "REAR") == 0)
+  {
+    return FIRETURN_RIGHT180;
+  }
+  return FIRETURN_NONE;
+}
+
+FireTurn inverseFireTurn(FireTurn turn)
+{
+  switch (turn)
+  {
+    case FIRETURN_LEFT90:   return FIRETURN_RIGHT90;
+    case FIRETURN_RIGHT90:  return FIRETURN_LEFT90;
+    case FIRETURN_RIGHT180: return FIRETURN_RIGHT180;
+    case FIRETURN_NONE:    return FIRETURN_NONE;
+  }
+  return FIRETURN_NONE;
+}
+
+unsigned long fireTurnDurationMs(FireTurn turn)
+{
+  switch (turn)
+  {
+    case FIRETURN_LEFT90:   return FIRE_TURN_LEFT_90_MS;
+    case FIRETURN_RIGHT90:  return FIRE_TURN_RIGHT_90_MS;
+    case FIRETURN_RIGHT180: return FIRE_TURN_RIGHT_180_MS;
+    case FIRETURN_NONE:    return 0UL;
+  }
+  return 0UL;
+}
+
+void startFireTurn(FireTurn turn)
+{
+  switch (turn)
+  {
+    case FIRETURN_LEFT90:
+      rotateLeft(PWM_FIRE_TURN);
+      Serial.println(F("[FIRE] turn LEFT 90"));
+      break;
+
+    case FIRETURN_RIGHT90:
+      rotateRight(PWM_FIRE_TURN);
+      Serial.println(F("[FIRE] turn RIGHT 90"));
+      break;
+
+    case FIRETURN_RIGHT180:
+      rotateRight(PWM_FIRE_TURN);
+      Serial.println(F("[FIRE] turn RIGHT 180"));
+      break;
+
+    case FIRETURN_NONE:
+      stopMotors();
+      Serial.println(F("[FIRE] no orientation turn"));
+      break;
+  }
+}
+
+bool buildVerifiedDisplayNames(const char* payload, char* dest, size_t destSize)
+{
+  if (!payload || !dest || destSize == 0)
+  {
+    return false;
+  }
+
+  dest[0] = '\0';
+  size_t used = 0;
+  uint8_t count = 0;
+  const char* p = payload;
+
+  while ((p = strstr(p, ":VERIFIED:")) != NULL)
+  {
+    p += 10;  // skip ":VERIFIED:"
+    const char* end = strchr(p, ',');
+    if (!end)
+    {
+      end = p + strlen(p);
+    }
+
+    const char* joiner = (count == 0) ? "" : " and ";
+    for (const char* j = joiner; *j && used + 1 < destSize; ++j)
+    {
+      dest[used++] = *j;
+    }
+
+    for (const char* n = p; n < end && used + 1 < destSize; ++n)
+    {
+      dest[used++] = (*n == '_') ? ' ' : *n;
+    }
+    dest[used] = '\0';
+    ++count;
+    p = end;
+  }
+
+  return count > 0;
+}
+
+unsigned long parseManualDurationMs(const char* arg)
+{
+  if (!arg)
+  {
+    return 1000UL;
+  }
+
+  while (*arg == ' ')
+  {
+    ++arg;
+  }
+
+  const unsigned long parsed = strtoul(arg, NULL, 10);
+  if (parsed == 0UL)
+  {
+    return 1000UL;
+  }
+  return min(parsed, 10000UL);
 }
 
 // ============================================================
@@ -782,6 +999,48 @@ void drawSecurityAlertOled(bool visible)
   display.display();
 }
 
+void drawVerifiedOled(const char* name)
+{
+  if (!oledReady) return;
+
+  const char* title = "[ VERIFIED ]";
+  const char* displayName = (name && name[0]) ? name : "Verified";
+  const uint8_t nameSize = (strlen(displayName) <= 10) ? 2 : 1;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(max(0, (SCREEN_WIDTH - (int)strlen(title) * 6) / 2), 0);
+  display.println(title);
+  display.drawLine(0, 10, SCREEN_WIDTH - 1, 10, SSD1306_WHITE);
+
+  display.setTextSize(nameSize);
+  const int nameWidth = (int)strlen(displayName) * 6 * nameSize;
+  display.setCursor(max(0, (SCREEN_WIDTH - nameWidth) / 2), nameSize == 2 ? 25 : 30);
+  display.println(displayName);
+  display.display();
+}
+
+void drawEmergencyStopOled()
+{
+  if (!oledReady) return;
+
+  const char* title = "[ EMERGENCY ]";
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(max(0, (SCREEN_WIDTH - (int)strlen(title) * 6) / 2), 0);
+  display.println(title);
+  display.drawLine(0, 10, SCREEN_WIDTH - 1, 10, SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(40, 20);
+  display.println(F("STOP"));
+  display.setTextSize(1);
+  display.setCursor(8, 52);
+  display.println(F("Send AUTO to resume"));
+  display.display();
+}
+
 // ============================================================
 // LED + OLED fast alert update (legacy — kept for reference)
 // Replaced by runCurrentMode() in the main loop.
@@ -856,6 +1115,8 @@ void enterPatrol()
   gMode = MODE_PATROL;
   gModeStartMs = millis();
   gPatrolSub = PSUB_FORWARD;
+  gPatrolSettleStartMs = 0;
+  gManualMotionEndMs = 0;
   alertBlinkOn = false;
   noTone(BUZZER_PIN);
   setStatusLed(CRGB::White);
@@ -873,11 +1134,19 @@ void enterFireAlert()
   // Detach servo so FastLED interrupt blocking (every 50 ms for LED blink)
   // does not corrupt the servo PWM signal and cause twitching.
   testServo.detach();
+  gFireTurn         = chooseFireTurn(gDirection);
+  gFireStage        = FIRESTAGE_PRE_SETTLE;
+  gFireStageStartMs = millis();
+  gFireSnapshotSent = false;
+  gFireClearCandidate = false;
+  gFireClearStartMs   = 0;
+  gManualMotionEndMs = 0;
   alertBlinkOn = false;
   lastBlinkMs = 0;
   Serial.println(F("[MODE] FIRE_ALERT"));
   Serial.println(F("MODE:FIRE_ALERT"));
   printHazardTrigger();   // log exactly which sensors fired and their raw values
+  Serial.println(F("STOP_AUDIO"));
   Serial.println(F("PLAY:alert_fire"));
   btSendFireAlert();
 }
@@ -888,6 +1157,7 @@ void enterVerification()
   gMode = MODE_VERIFICATION;
   gModeStartMs = millis();
   gVerifServoScanned = false;
+  gManualMotionEndMs = 0;
   stopMotors();
   // Re-attach servo before using it (may have been detached during FIRE_ALERT).
   testServo.attach(SERVO_PIN);
@@ -906,6 +1176,7 @@ void enterSecurityAlert()
   gVerifPendingResolution = false;
   gMode = MODE_SECURITY_ALERT;
   gModeStartMs = millis();
+  gManualMotionEndMs = 0;
   stopMotors();
   // Re-attach in case servo was detached during FIRE_ALERT, center, then
   // detach again so FastLED blinking does not cause twitching here either.
@@ -918,6 +1189,46 @@ void enterSecurityAlert()
   Serial.println(F("MODE:SECURITY_ALERT"));
   Serial.println(F("PLAY:alert_intruder"));
   btSendSecurityAlert();
+}
+
+void enterVerifiedPause(const char* names)
+{
+  gMode = MODE_VERIFIED_PAUSE;
+  gModeStartMs = millis();
+  gManualMotionEndMs = 0;
+  setStatusLed(CRGB::Green);
+  drawVerifiedOled(names);
+  stopMotors();
+  Serial.println(F("[MODE] VERIFIED"));
+  Serial.println(F("MODE:VERIFIED"));
+}
+
+void enterEmergencyStop()
+{
+  gMode = MODE_EMERGENCY_STOP;
+  gModeStartMs = millis();
+  gManualMotionEndMs = 0;
+  stopMotors();
+  testServo.detach();
+  noTone(BUZZER_PIN);
+  alertBlinkOn = true;
+  lastBlinkMs = millis();
+  setStatusLed(CRGB::Red);
+  drawEmergencyStopOled();
+  Serial.println(F("[MODE] EMERGENCY_STOP"));
+  Serial.println(F("MODE:EMERGENCY_STOP"));
+}
+
+void enterManualDrive()
+{
+  gMode = MODE_MANUAL_DRIVE;
+  gModeStartMs = millis();
+  gManualMotionEndMs = 0;
+  stopMotors();
+  drawNormalOled();
+  setStatusLed(CRGB::White);
+  Serial.println(F("[MODE] MANUAL"));
+  Serial.println(F("MODE:MANUAL"));
 }
 
 // ── mode runners (called every loop tick) ─────────────────────────────────
@@ -933,31 +1244,88 @@ void runPatrol()
 
   const unsigned long nowMs = millis();
 
-  if (gPatrolSub == PSUB_FORWARD)
+  switch (gPatrolSub)
   {
-    const float frontCm = readDistanceMedian(PATROL_FRONT_TRIG, PATROL_FRONT_ECHO);
+    case PSUB_FORWARD:
+    {
+      const float frontCm = readDistanceMedian(PATROL_FRONT_TRIG, PATROL_FRONT_ECHO);
+      if (frontCm > FRONT_WALL_SLOW_CM || frontCm <= 0.0f)
+      {
+        driveForward(PWM_FORWARD);
+      }
+      else if (frontCm > FRONT_WALL_STOP_CM)
+      {
+        gPatrolSub = PSUB_SLOW;
+        driveForward(PWM_SLOW_FORWARD);
+      }
+      else
+      {
+        stopMotors();
+        gPatrolSettleStartMs = nowMs;
+        gPatrolSub = PSUB_PRE_TURN_SETTLE;
+      }
+      break;
+    }
 
-    if (frontCm > 0.0f && frontCm <= FRONT_WALL_STOP_CM)
+    case PSUB_SLOW:
     {
+      const float frontCm = readDistanceMedian(PATROL_FRONT_TRIG, PATROL_FRONT_ECHO);
+      if (frontCm > 0.0f && frontCm <= FRONT_WALL_STOP_CM)
+      {
+        stopMotors();
+        gPatrolSettleStartMs = nowMs;
+        gPatrolSub = PSUB_PRE_TURN_SETTLE;
+      }
+      else if (frontCm > FRONT_WALL_SLOW_CM || frontCm <= 0.0f)
+      {
+        gPatrolSub = PSUB_FORWARD;
+        driveForward(PWM_FORWARD);
+      }
+      else
+      {
+        driveForward(PWM_SLOW_FORWARD);
+      }
+      break;
+    }
+
+    case PSUB_PRE_TURN_SETTLE:
       stopMotors();
-      delay(STOP_SETTLE_MS);
-      gPatrolSub = PSUB_TURNING;
-      gPatrolTurnStartMs = nowMs;
-      rotateRight(PWM_TURN_90);
-    }
-    else
+      if (nowMs - gPatrolSettleStartMs >= STOP_SETTLE_MS)
+      {
+        choosePatrolTurnDirection();
+        if (gPatrolTurnLeft)
+        {
+          rotateLeft(PWM_TURN_90);
+        }
+        else
+        {
+          rotateRight(PWM_TURN_90);
+        }
+        gPatrolTurnStartMs = millis();
+        gPatrolSub = PSUB_TURNING;
+      }
+      break;
+
+    case PSUB_TURNING:
     {
-      driveForward(PWM_FORWARD);
+      const unsigned long turnMs = gPatrolTurnLeft ? TURN_LEFT_90_MS : TURN_RIGHT_90_MS;
+      if (nowMs - gPatrolTurnStartMs >= turnMs)
+      {
+        stopMotors();
+        gPatrolSettleStartMs = nowMs;
+        gPatrolSub = PSUB_POST_TURN_SETTLE;
+      }
+      break;
     }
-  }
-  else  // PSUB_TURNING
-  {
-    if (nowMs - gPatrolTurnStartMs >= TURN_RIGHT_90_MS)
-    {
+
+    case PSUB_POST_TURN_SETTLE:
       stopMotors();
-      delay(STOP_SETTLE_MS);
-      gPatrolSub = PSUB_FORWARD;
-    }
+      if (nowMs - gPatrolSettleStartMs >= STOP_SETTLE_MS)
+      {
+        driveForward(PWM_FORWARD);
+        gPatrolSub = PSUB_FORWARD;
+      }
+      break;
   }
 }
 
@@ -982,22 +1350,104 @@ void runFireAlert()
     drawAlertOled(alertBlinkOn);
   }
 
-  if (nowMs - gModeStartMs >= FIRE_ALERT_DURATION_MS)
+  switch (gFireStage)
   {
-    noTone(BUZZER_PIN);
-    if (gPreFireMode == MODE_VERIFICATION)
-    {
-      // Fire interrupted an active verification.
-      // resumeVerification() skips the announcement + servo scan (already done)
-      // and just waits for Jetson STATUS response with a fresh timeout window.
-      // If the person left during the fire alert, the next STATUS:CLEAR will
-      // trigger security alert because gVerifPendingResolution is still true.
-      resumeVerification();
-    }
-    else
-    {
-      enterPatrol();
-    }
+    case FIRESTAGE_PRE_SETTLE:
+      stopMotors();
+      if (nowMs - gFireStageStartMs >= FIRE_PRE_SETTLE_MS)
+      {
+        if (gFireTurn == FIRETURN_NONE)
+        {
+          gFireStage = FIRESTAGE_HOLDING;
+        }
+        else
+        {
+          startFireTurn(gFireTurn);
+          gFireStage = FIRESTAGE_ORIENTING;
+        }
+        gFireStageStartMs = nowMs;
+      }
+      break;
+
+    case FIRESTAGE_ORIENTING:
+      if (nowMs - gFireStageStartMs >= fireTurnDurationMs(gFireTurn))
+      {
+        stopMotors();
+        gFireStage = FIRESTAGE_HOLDING;
+        gFireStageStartMs = nowMs;
+      }
+      break;
+
+    case FIRESTAGE_HOLDING:
+      stopMotors();
+      if (nowMs - gFireStageStartMs >= FIRE_SNAPSHOT_SETTLE_MS)
+      {
+        if (!gFireSnapshotSent)
+        {
+          Serial.println(F("SNAP:fire"));
+          gFireSnapshotSent = true;
+        }
+        gFireStage = FIRESTAGE_SNAPSHOT_WAIT;
+        gFireStageStartMs = nowMs;
+      }
+      break;
+
+    case FIRESTAGE_SNAPSHOT_WAIT:
+      stopMotors();
+      if (nowMs - gFireStageStartMs >= FIRE_POST_SNAPSHOT_MS)
+      {
+        const FireTurn restoreTurn = inverseFireTurn(gFireTurn);
+        startFireTurn(restoreTurn);
+        gFireStageStartMs = nowMs;
+        if (gFireTurn == FIRETURN_NONE)
+        {
+          gFireStage = FIRESTAGE_CLEAR_WAIT;
+        }
+        else
+        {
+          gFireStage = FIRESTAGE_RESTORING;
+        }
+      }
+      break;
+
+    case FIRESTAGE_RESTORING:
+      if (nowMs - gFireStageStartMs >= fireTurnDurationMs(inverseFireTurn(gFireTurn)))
+      {
+        stopMotors();
+        gFireStage = FIRESTAGE_CLEAR_WAIT;
+        gFireStageStartMs = nowMs;
+      }
+      break;
+
+    case FIRESTAGE_CLEAR_WAIT:
+      stopMotors();
+      if (gHazardDetected)
+      {
+        gFireClearCandidate = false;
+      }
+      else if (!gFireClearCandidate)
+      {
+        gFireClearCandidate = true;
+        gFireClearStartMs = nowMs;
+      }
+      else if (nowMs - gFireClearStartMs >= FIRE_CLEAR_STABLE_MS)
+      {
+        noTone(BUZZER_PIN);
+        if (gPreFireMode == MODE_VERIFICATION)
+        {
+          // Fire interrupted an active verification.
+          // resumeVerification() skips the announcement + servo scan (already done)
+          // and just waits for Jetson STATUS response with a fresh timeout window.
+          // If the person left during the fire alert, the next STATUS:CLEAR will
+          // trigger security alert because gVerifPendingResolution is still true.
+          resumeVerification();
+        }
+        else
+        {
+          enterPatrol();
+        }
+      }
+      break;
   }
 }
 
@@ -1121,14 +1571,61 @@ void runSecurityAlert()
   }
 }
 
+void runVerifiedPause()
+{
+  if (millis() - gModeStartMs >= VERIFIED_PAUSE_MS)
+  {
+    enterPatrol();
+  }
+}
+
+void runEmergencyStop()
+{
+  stopMotors();
+
+  const unsigned long nowMs = millis();
+  if (nowMs - lastBlinkMs >= ALERT_BLINK_MS)
+  {
+    lastBlinkMs = nowMs;
+    alertBlinkOn = !alertBlinkOn;
+    if (alertBlinkOn)
+    {
+      setStatusLed(CRGB::Red);
+    }
+    else
+    {
+      setStatusLed(CRGB::Black);
+    }
+  }
+}
+
+void runManualDrive()
+{
+  if (gManualMotionEndMs > 0UL && millis() >= gManualMotionEndMs)
+  {
+    stopMotors();
+    gManualMotionEndMs = 0;
+    Serial.println(F("[DRIVE] complete"));
+  }
+}
+
 void runCurrentMode()
 {
+  if (gHazardDetected && gMode == MODE_EMERGENCY_STOP)
+  {
+    enterFireAlert();
+    return;
+  }
+
   switch (gMode)
   {
-    case MODE_PATROL:         runPatrol();        break;
-    case MODE_FIRE_ALERT:     runFireAlert();     break;
-    case MODE_VERIFICATION:   runVerification();  break;
-    case MODE_SECURITY_ALERT: runSecurityAlert(); break;
+    case MODE_PATROL:          runPatrol();         break;
+    case MODE_FIRE_ALERT:      runFireAlert();      break;
+    case MODE_VERIFICATION:    runVerification();   break;
+    case MODE_SECURITY_ALERT:  runSecurityAlert();  break;
+    case MODE_VERIFIED_PAUSE:  runVerifiedPause();  break;
+    case MODE_EMERGENCY_STOP:  runEmergencyStop();  break;
+    case MODE_MANUAL_DRIVE:    runManualDrive();    break;
   }
 }
 
@@ -1482,17 +1979,21 @@ void handleStatusPacket(const char* payload)
       {
         // No SCANNING, no UNKNOWN → all announced persons are VERIFIED
         gVerifPendingResolution = false;  // clean exit — disarm the CLEAR→alert trigger
+        char displayNames[64] = "";
+        buildVerifiedDisplayNames(payload, displayNames, sizeof(displayNames));
         playVerifiedNames(payload);
-        setStatusLed(CRGB::Green);
-        delay(800);
-        enterPatrol();
+        enterVerifiedPause(displayNames);
+        return;
       }
       break;
 
-    // ── FIRE_ALERT / SECURITY_ALERT ────────────────────────────────────────
+    // ── modes that STATUS must not interrupt ───────────────────────────────
     case MODE_FIRE_ALERT:
     case MODE_SECURITY_ALERT:
-      // These modes run to their timed conclusion — STATUS does not interrupt them
+    case MODE_VERIFIED_PAUSE:
+    case MODE_EMERGENCY_STOP:
+    case MODE_MANUAL_DRIVE:
+      // These modes own their transitions — STATUS does not interrupt them.
       break;
   }
 }
@@ -1577,6 +2078,61 @@ void dispatchJetsonLine(const char* line)
     return;
   }
 
+  // ── remote mode / drive commands ──────────────────────────────────────────
+  if (strcmp(line, "EMERGENCY_STOP") == 0)
+  {
+    enterEmergencyStop();
+    return;
+  }
+
+  if (strcmp(line, "AUTO") == 0)
+  {
+    if (gMode == MODE_EMERGENCY_STOP || gMode == MODE_MANUAL_DRIVE)
+    {
+      enterPatrol();
+    }
+    return;
+  }
+
+  if (strcmp(line, "MANUAL") == 0)
+  {
+    enterManualDrive();
+    return;
+  }
+
+  if (strcmp(line, "STOP") == 0)
+  {
+    if (gMode == MODE_MANUAL_DRIVE)
+    {
+      stopMotors();
+      gManualMotionEndMs = 0;
+      Serial.println(F("[DRIVE] STOP"));
+    }
+    return;
+  }
+
+  if ((line[0] == 'F' || line[0] == 'B' || line[0] == 'L' || line[0] == 'R') &&
+      (line[1] == '\0' || line[1] == ' '))
+  {
+    if (gMode == MODE_MANUAL_DRIVE)
+    {
+      const unsigned long durationMs = parseManualDurationMs(line + 1);
+      switch (line[0])
+      {
+        case 'F': driveForward(PWM_FORWARD); break;
+        case 'B': driveBackward(PWM_BACKUP); break;
+        case 'L': rotateLeft(PWM_TURN_90); break;
+        case 'R': rotateRight(PWM_TURN_90); break;
+      }
+      gManualMotionEndMs = millis() + durationMs;
+      Serial.print(F("[DRIVE] "));
+      Serial.print(line[0]);
+      Serial.print(F(" ms="));
+      Serial.println(durationMs);
+    }
+    return;
+  }
+
   // ── HEARTBEAT ──────────────────────────────────────────────────────────────
   // Keep-alive from Jetson ArduinoLink background thread. STATUS:CLEAR serves
   // the same purpose when no persons are tracked, but HEARTBEAT is kept as a
@@ -1604,7 +2160,12 @@ void handleSerial()
     {
       sLineBuf[sLineLen] = '\0';
 
-      if (sLineLen == 1)
+      if (sLineLen == 1 &&
+          (sLineBuf[0] == 'F' || sLineBuf[0] == 'B' || sLineBuf[0] == 'L' || sLineBuf[0] == 'R'))
+      {
+        dispatchJetsonLine(sLineBuf);
+      }
+      else if (sLineLen == 1)
       {
         // single interactive command — keep existing behaviour
         dispatchSingleChar((char)tolower((unsigned char)sLineBuf[0]));

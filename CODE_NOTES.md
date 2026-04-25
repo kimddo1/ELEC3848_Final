@@ -22,6 +22,7 @@ See SESSION_NOTES.md for environment, errors, pipeline architecture, and enrollm
 | `snapshot_writer.py` | Saves JPEG frame crops + CSV event log at each track transition | Active |
 | `generate_audio.py` | Generates all required WAV clips via espeak+sox (run once on Jetson) | Run once |
 | `bt_receiver.py` | Remote laptop script — reads HC-05 BT serial, prints formatted alerts | Run on laptop |
+| `web_dashboard.py` | Standard-library HTTP dashboard copied from Phase2 — live MJPEG, snapshots, events, remote controls | Active |
 
 ---
 
@@ -58,6 +59,8 @@ PERSON_CLS             = 0      # COCO class 0 = person
 - `track_names = {}` dict maps `track_id → name`; populated on verification, used by `draw()`
 - `face_id.close()` called after the main loop to prevent segfault on exit
 - Camera opened via GStreamer pipeline (`nvarguscamerasrc`, flip-method=2)
+- Starts `DashboardServer` from `web_dashboard.py` when available; pushes live annotated frames plus runtime metrics (`fps`, people, verified, unknown, pending) to the browser
+- Dashboard controls are translated to Arduino serial commands in-process: emergency stop → `EMERGENCY_STOP`, start patrol → `AUTO`, stop patrol → `MANUAL` then `STOP`
 
 ---
 
@@ -439,12 +442,13 @@ JPEG_QUALITY = 92
 | `start()` | Launches background daemon thread |
 | `stop()` | Sets stop event, joins thread (max 5 s) |
 | `_run()` | Thread body: connect, send heartbeats, flush outbound queue, read inbound lines, auto-reconnect on error |
-| `_dispatch(line)` | Parses inbound line; calls handlers for `PLAY`/`MODE`/`SNAP`, prints others as Arduino debug |
+| `_dispatch(line)` | Parses inbound line; calls handlers for `PLAY`/`STOP_AUDIO`/`MODE`/`SNAP`, prints others as Arduino debug |
 
 **`default_command_handler(cmd, arg)`** — used by `detect_people.py`:
-- `PLAY:<name>` → stub (Phase 5: `audio_player.play(arg)`)
+- `PLAY:<name>` → `audio_player.play(arg)`
+- `STOP_AUDIO` → `audio_player.stop()`
 - `MODE:<state>` → prints current Arduino mode
-- `SNAP:<category>` → stub (Phase 7: `snapshot_writer.save(frame, arg)`)
+- `SNAP:<category>` → `snapshot_writer.save_current(arg)`
 
 **Jetson → Arduino events:**
 
@@ -461,8 +465,9 @@ JPEG_QUALITY = 92
 | Command | Meaning |
 |---|---|
 | `PLAY:<name>` | Play named audio clip |
+| `STOP_AUDIO` | Stop the currently playing audio clip |
 | `MODE:<state>` | Log current Arduino mode |
-| `SNAP:<category>` | Save snapshot frame |
+| `SNAP:<category>` | Save current full-frame snapshot, including `SNAP:fire` |
 
 **Key config:**
 ```python
@@ -470,6 +475,42 @@ SERIAL_PORT          = "/dev/ttyUSB0"   # or /dev/ttyACM0
 SERIAL_BAUD          = 115200
 RECONNECT_DELAY_S    = 3.0
 HEARTBEAT_INTERVAL_S = 2.0
+```
+
+---
+
+## web_dashboard.py
+
+**Role:** Standard-library HTTP dashboard copied from `PatrolPro_Phase2/web_dashboard.py`. Runs on the Jetson side and exposes live video, saved snapshots, event logs, and remote control endpoints without requiring Flask. It is now started by `detect_people.py` during the main runtime.
+
+**Key classes / functions:**
+
+| Name | What it does |
+|---|---|
+| `DashboardState` | Stores the latest encoded MJPEG frame and lightweight status payload. |
+| `DashboardServer` | Starts/stops a threaded HTTP server, updates frames, and exposes a URL hint. |
+| `_make_handler(dashboard)` | Builds the request handler for HTML, MJPEG stream, APIs, snapshot files, and control POST endpoints. |
+
+**Important endpoints:**
+
+| Endpoint | Purpose |
+|---|---|
+| `/` | Dashboard HTML UI |
+| `/stream.mjpg` | Live MJPEG stream |
+| `/api/status` | Current dashboard/runtime status |
+| `/api/snapshots` | Snapshot listing |
+| `/api/events` | CSV event log rows as JSON |
+| `/api/control/emergency-stop` | Sends emergency stop through the configured control handler |
+| `/api/control/auto-patrol` | Sends AUTO/resume through the configured control handler |
+| `/api/control/patrol-stop` | Sends patrol stop through the configured control handler |
+
+**Key config:**
+```python
+DEFAULT_HOST         = "0.0.0.0"
+DEFAULT_PORT         = 8080
+DEFAULT_JPEG_QUALITY = 82
+DEFAULT_STREAM_FPS   = 8.0
+DEFAULT_STREAM_WIDTH = 960
 ```
 
 ---
@@ -501,6 +542,8 @@ HEARTBEAT_INTERVAL_S = 2.0
 | Session 4 | Added `_send(link, msg, note)` helper — wraps `link.send()` with clean `[Jetson→Arduino]` terminal print. Added `last_face_status` dict to suppress repeated face-status prints (only prints on change). Replaced all bare `link.send()` calls with `_send()`. Cleaned startup messages. |
 | Session 4 | Added `ANNOUNCE_CONFIRM_FRAMES=24` gate: a new track must be continuously active for 24 consecutive frames before it enters the `announced` set and appears in STATUS packets. Prevents ghost re-ID tracks from triggering false verification cycles. `announce_count{}` dict tracks per-track frame count. |
 | Session 4 | **STATUS-packet protocol (replaces individual events):** Removed individual `_send()` calls for `PERSON_DETECTED`, `FACE_VERIFIED:<name>`, `FACE_UNKNOWN`, `FACE_TIMEOUT`. Replaced with a `STATUS:<payload>` packet built and sent every face-ID cycle (~3 Hz). Payload is comma-separated `T{tid}:SCANNING`, `T{tid}:VERIFIED:{name}`, or `T{tid}:UNKNOWN` entries for all tracks in `announced`; `CLEAR` when none. Added `confirmed_unknown` set (replaces `face_unknown_sent`), `verified_played` set (one-shot dedup for snapshot/log). Cleaned up vanish handler: tracks removed from all state when pruned from `tracker.tracks`; no explicit FACE_TIMEOUT event needed. STATUS is only printed to terminal when payload changes (`last_status` dedup). |
+| Session 5 | Verified `SNAP:fire` requires no `detect_people.py` source change: Arduino `SNAP:<category>` commands already route through `arduino_link.default_command_handler()` to `snapshot_writer.save_current(arg)`, and `snapshot_writer.save_current("fire")` exists. |
+| Session 6 | Integrated `web_dashboard.py` into the main runtime. `detect_people.py` now starts `DashboardServer`, streams the annotated camera frame to `/stream.mjpg`, publishes runtime metrics/status, and maps dashboard controls to Arduino serial commands (`EMERGENCY_STOP`, `AUTO`, `MANUAL` + `STOP`). |
 
 ### enroll.py
 | When | Change |
@@ -549,6 +592,7 @@ HEARTBEAT_INTERVAL_S = 2.0
 | Session 3 | Created. Jetson-side USB serial bridge. Background thread, auto-reconnect, heartbeat, `send()`/`register_command_handler()`. Wired into `detect_people.py`. |
 | Session 3 | **Phase 5:** Imported `audio_player`. Updated `default_command_handler` — `PLAY:` now calls `audio_player.play(arg)` instead of stub. |
 | Session 3 | **Phase 7:** Imported `snapshot_writer`. Updated `default_command_handler` — `SNAP:` now calls `snapshot_writer.save_current(arg)` instead of stub. |
+| Session 5 | Added Arduino→Jetson `STOP_AUDIO` support: `_dispatch()` now recognizes it and `default_command_handler()` calls `audio_player.stop()`. |
 
 ### hazard_monitor/hazard_monitor.ino (Phase 8 additions)
 | When | Change |
@@ -562,6 +606,7 @@ HEARTBEAT_INTERVAL_S = 2.0
 | Session 4 | Added `waitOrFireAlert(ms)`: replaces bare `delay()` calls inside the Phase 1 servo scan block. Polls `updateHazardState()` every 20 ms; if `gHazardDetected` becomes true mid-scan, calls `enterFireAlert()` and returns `true` so `runVerification()` can immediately return. This makes fire detection responsive during the entire ~7-second blocking scan window. All five delays in Phase 1 (audio wait, forward sweep steps, hold, return sweep steps, settle) now use this helper. |
 | Session 4 | `SERVO_CENTER_DEG` changed 90→100. Verification return sweep replaced `centerServo()` snap-back with a symmetric step loop (same `SERVO_STEP_DEG`/`SERVO_STEP_DELAY_MS` as the forward sweep) so 130→100 is as slow as 100→130. Added `gPreFireMode` global. `enterFireAlert()` saves current mode to `gPreFireMode` before transitioning. `runVerification()` checks `gHazardDetected` at top — if fire detected, calls `enterFireAlert()` and returns. Added `gVerifPendingResolution` bool: set true on first SCANNING packet in VERIFICATION, cleared false when all resolve to VERIFIED or on entering patrol/security/verification. `handleStatusPacket()` CLEAR branch: if `gVerifPendingResolution` → `enterSecurityAlert()` ("ran away"), else `enterPatrol()`. Added `resumeVerification()`: lightweight re-entry after fire interrupt — skips audio/scan (sets `gVerifServoScanned=true`), re-attaches servo, re-centers, resets timeout, does NOT reset `gVerifPendingResolution` so CLEAR still triggers alert if person left during fire. `runFireAlert()` now calls `resumeVerification()` instead of `enterVerification()` when `gPreFireMode==MODE_VERIFICATION`. |
 | Session 4 | Fixed servo twitching during FIRE_ALERT and SECURITY_ALERT: `FastLED.show()` disables interrupts ~720 µs every 50 ms for LED blinking, corrupting the Servo library's 20 ms PWM pulse. Fix: `testServo.detach()` in `enterFireAlert()`; `testServo.attach(SERVO_PIN)` at start of `enterVerification()` and `enterSecurityAlert()` (with immediate detach again after centering in security alert). Also increased `VERIF_SERVO_TRIGGER_MS` 3000→6000 ms so `detected_person.wav` finishes before `approach_camera.wav` starts. |
+| Session 5 | Added `STOP_AUDIO` before `PLAY:alert_fire`. Reworked patrol avoidance into millis-based substates with slow zone and left/right ultrasonic turn choice. Added fire orientation stage machine (`SNAP:fire`, restore turn, stable clear wait), `MODE_VERIFIED_PAUSE`, `MODE_EMERGENCY_STOP`, and `MODE_MANUAL_DRIVE` with serial commands (`MANUAL`, `AUTO`, `STOP`, `F/B/L/R <ms>`, `EMERGENCY_STOP`). |
 
 ### audio_player.py
 | When | Change |
@@ -584,6 +629,12 @@ HEARTBEAT_INTERVAL_S = 2.0
 |---|---|
 | Session 3 | **Phase 8:** Created. Connects to HC-05 paired BT port, reads JSON alert lines, pretty-prints with local timestamp. Auto-reconnects on disconnect. Set `BT_PORT` before running. |
 
+### web_dashboard.py
+| When | Change |
+|---|---|
+| Session 5 | Copied unchanged from `PatrolPro_Phase2/web_dashboard.py`. Adds standard-library dashboard server with live MJPEG stream, snapshot/event APIs, and remote control POST endpoints. |
+| Session 6 | Connected to `detect_people.py` runtime. The dashboard now receives live frames and status updates from the main Jetson loop, and its control endpoints are backed by Arduino serial commands through `ArduinoLink`. |
+
 ### audio/generate_clips.sh
 | When | Change |
 |---|---|
@@ -600,3 +651,5 @@ HEARTBEAT_INTERVAL_S = 2.0
 | Session 2 | Created |
 | Session 3 | Added `Servo_test/Servo_test.ino` to file index and full detail section. Expanded `hazard_monitor/hazard_monitor.ino` section with full pin table, all functions, serial commands, config values, and alert behaviour. |
 | Session 3 | Added `wall_bounce/wall_bounce.ino` and `arduino_link.py` — file index entries, full detail sections, edit history rows. |
+| Session 5 | Added `web_dashboard.py` file index/detail section and documented STOP_AUDIO, fire snapshot handling, Arduino mode additions, and dashboard copy. |
+| Session 6 | Updated notes to reflect live dashboard integration from `detect_people.py`, including runtime metrics and web-to-Arduino control mapping. |

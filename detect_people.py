@@ -11,6 +11,7 @@ from face_id import FaceIdentifier, draw_face_result
 from arduino_link import ArduinoLink, default_command_handler
 import snapshot_writer
 import audio_player
+from web_dashboard import DashboardServer
 
 # ── graceful shutdown flag ────────────────────────────────────────────────────
 # SIGINT handler sets this; main loop checks it each frame instead of catching
@@ -37,6 +38,8 @@ ANNOUNCE_CONFIRM_FRAMES = 24 # consecutive active frames before PERSON_DETECTED 
                               # = ~1 s at 24 FPS — ghost re-ID tracks die before reaching this
 PERSON_CLS  = 0          # COCO class 0 = person
 ARDUINO_PORT = "/dev/ttyUSB0"   # Arduino Mega (genuine): ttyACM0; CH340 clone: ttyUSB0
+DASHBOARD_HOST = "0.0.0.0"
+DASHBOARD_PORT = 8080
 
 GST_PIPELINE = (
     "nvarguscamerasrc ! "
@@ -263,6 +266,57 @@ def _send(link, msg, note=""):
     print(f"  [Jetson→Arduino] {msg}{suffix}")
 
 
+def _handle_arduino_command(runtime_state, cmd, arg):
+    """Capture Arduino runtime info, then run the default Jetson handler."""
+    now = time.time()
+    if cmd == "MODE":
+        runtime_state["arduino_mode"] = arg
+        runtime_state["arduino_mode_updated_at"] = now
+    elif cmd == "PLAY":
+        runtime_state["last_audio_command"] = arg
+        runtime_state["last_audio_command_at"] = now
+    elif cmd == "STOP_AUDIO":
+        runtime_state["last_audio_command"] = ""
+        runtime_state["last_audio_command_at"] = now
+    elif cmd == "SNAP":
+        runtime_state["last_snapshot_command"] = arg
+        runtime_state["last_snapshot_command_at"] = now
+
+    default_command_handler(cmd, arg)
+
+
+def _make_dashboard_control_handler(link):
+    """Translate dashboard button actions into Arduino serial commands."""
+    def control_handler(command):
+        if command == "EMERGENCY_STOP":
+            print("  [Web→Arduino] EMERGENCY_STOP")
+            link.send("EMERGENCY_STOP")
+            snapshot_writer.log_event("WEB_EMERGENCY_STOP", -1, "", "WEB")
+        elif command == "AUTO_PATROL":
+            print("  [Web→Arduino] AUTO")
+            link.send("AUTO")
+            snapshot_writer.log_event("WEB_AUTO_PATROL", -1, "", "WEB")
+        elif command == "PATROL_STOP":
+            print("  [Web→Arduino] MANUAL")
+            print("  [Web→Arduino] STOP")
+            link.send("MANUAL")
+            link.send("STOP")
+            snapshot_writer.log_event("WEB_PATROL_STOP", -1, "", "WEB")
+        else:
+            return {
+                "ok": False,
+                "error": "unsupported command",
+                "arduino_connected": link.is_connected(),
+            }
+
+        return {
+            "ok": True,
+            "arduino_connected": link.is_connected(),
+        }
+
+    return control_handler
+
+
 def main():
     print("Loading TRT engine...")
     engine  = load_engine(ENGINE_PATH)
@@ -281,10 +335,33 @@ def main():
     verified_played    = set() # track_ids for which verified audio was triggered (one-shot)
     last_face_status   = {}    # tid -> last printed face status (suppress repeats)
     last_status        = ""    # last STATUS payload — only print when it changes
+    runtime_state = {
+        "arduino_mode": "",
+        "arduino_mode_updated_at": 0.0,
+        "last_audio_command": "",
+        "last_audio_command_at": 0.0,
+        "last_snapshot_command": "",
+        "last_snapshot_command_at": 0.0,
+    }
 
     link = ArduinoLink(port=ARDUINO_PORT)
-    link.register_command_handler(default_command_handler)
+    link.register_command_handler(
+        lambda cmd, arg: _handle_arduino_command(runtime_state, cmd, arg)
+    )
     link.start()
+
+    dashboard = None
+    try:
+        dashboard = DashboardServer(
+            host=DASHBOARD_HOST,
+            port=DASHBOARD_PORT,
+            control_handler=_make_dashboard_control_handler(link),
+        )
+        dashboard.start()
+        print(f"[Dashboard] ready — {dashboard.url_hint()}")
+    except OSError as exc:
+        dashboard = None
+        print(f"[Dashboard] disabled — {exc}")
 
     print("Opening camera...")
     cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
@@ -437,6 +514,26 @@ def main():
         cv2.putText(frame, f"FPS: {fps:.1f}",
                     (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 200, 0), 2)
 
+        if dashboard is not None:
+            visible_ids = set(active_tracks.keys())
+            dashboard.update_frame(frame, status={
+                "fps": fps,
+                "people": len(active_tracks),
+                "verified": sum(1 for tid in visible_ids if tid in tracker.verified),
+                "unknown": sum(1 for tid in announced if tid in confirmed_unknown),
+                "pending": sum(
+                    1
+                    for tid in announced
+                    if tid not in tracker.verified and tid not in confirmed_unknown
+                ),
+                "arduino_connected": link.is_connected(),
+                "arduino_mode": runtime_state["arduino_mode"],
+                "status_payload": last_status,
+                "serial_port": ARDUINO_PORT,
+                "last_audio_command": runtime_state["last_audio_command"],
+                "last_snapshot_command": runtime_state["last_snapshot_command"],
+            })
+
         cv2.imshow("YOLO11n - Person Detection", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -446,6 +543,8 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     face_id.close()
+    if dashboard is not None:
+        dashboard.stop()
     link.stop()
     print("[Main] Done.")
     # os._exit bypasses pycuda.autoinit's CUDA context destructor which causes

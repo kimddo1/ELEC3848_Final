@@ -4,7 +4,7 @@ Jetson-side USB serial bridge to Arduino Mega.
 
 Architecture:
   - Background thread continuously reads newline-terminated lines from Arduino.
-  - Dispatches PLAY / MODE / SNAP commands to registered callbacks.
+  - Dispatches PLAY / STOP_AUDIO / MODE / SNAP commands to registered callbacks.
   - Main thread calls send() to push Jetson event strings to Arduino.
   - Thread-safe: outbound writes go through a queue.Queue.
 
@@ -17,6 +17,7 @@ Jetson -> Arduino events (sent via send()):
 
 Arduino -> Jetson commands (received via callback):
   PLAY:<name>              play named audio clip (e.g. alert_fire, verified)
+  STOP_AUDIO               stop any currently playing audio clip
   MODE:<state>             current Arduino mode (PATROL / FIRE_ALERT / ...)
   SNAP:<category>          save a snapshot frame (person / face / verified)
 """
@@ -54,7 +55,7 @@ class ArduinoLink:
 
     Command handler signature:
         def my_handler(cmd: str, arg: str): ...
-        # cmd in {"PLAY", "MODE", "SNAP"}
+        # cmd in {"PLAY", "STOP_AUDIO", "MODE", "SNAP"}
         # arg is the part after ':', e.g. "alert_fire", "PATROL", "person"
     """
 
@@ -152,7 +153,7 @@ class ArduinoLink:
             self._stop_event.wait(RECONNECT_DELAY_S)
 
     def _dispatch(self, line: str):
-        """Parse inbound line and call registered handlers for PLAY/MODE/SNAP."""
+        """Parse inbound line and call registered handlers for PLAY/STOP_AUDIO/MODE/SNAP."""
         if ":" in line:
             cmd, _, arg = line.partition(":")
         else:
@@ -161,7 +162,7 @@ class ArduinoLink:
         cmd = cmd.strip().upper()
         arg = arg.strip()
 
-        if cmd not in ("PLAY", "MODE", "SNAP"):
+        if cmd not in ("PLAY", "STOP_AUDIO", "MODE", "SNAP"):
             # Pass through informational Arduino prints, suppress empty lines
             if line.strip():
                 print(f"  [Arduino] {line}")
@@ -180,12 +181,17 @@ def default_command_handler(cmd: str, arg: str):
     """
     Handles commands sent from Arduino to Jetson.
     PLAY  → audio_player.play(arg)
+    STOP_AUDIO → audio_player.stop()
     MODE  → log current Arduino mode
     SNAP  → trigger snapshot_writer
     """
     if cmd == "PLAY":
         print(f"  [Arduino→Jetson] PLAY:{arg}")
         audio_player.play(arg)
+
+    elif cmd == "STOP_AUDIO":
+        print("  [Arduino→Jetson] STOP_AUDIO")
+        audio_player.stop()
 
     elif cmd == "MODE":
         print(f"\n{'─'*40}")
