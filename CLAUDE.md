@@ -16,7 +16,7 @@ Patrol Pro — autonomous security patrol robot. Jetson Nano handles vision (YOL
 1. **English only** — no Korean (or any other non-English) in code, comments, or strings.
 2. **Arduino is the brain** — do not move mode state into Jetson. Jetson sends events; Arduino decides.
 3. **Do not break the existing pipeline.** SCRFD + MobileFaceNet TRT is confirmed working. Before editing `face_id.py` or `detect_people.py`, check CODE_NOTES.md for the edit history and rationale.
-4. **Keep existing pin assignments** from `hazard_monitor/hazard_monitor.ino` and `Servo_test/Servo_test.ino`.
+4. **Keep existing pin assignments** from `hazard_monitor/hazard_monitor.ino` and `archive/reference_only/Servo_test/Servo_test.ino`.
 5. **Update CODE_NOTES.md** whenever a source file is edited or added (add an entry to that file's Edit History table).
 6. **Update SESSION_NOTES.md** when a new environment issue / error is discovered and fixed.
 

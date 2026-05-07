@@ -11,7 +11,7 @@ See `SESSION_NOTES.md` (environment, errors, TRT build) and `CODE_NOTES.md` (per
 
 1. **Arduino Mega is the brain.** Main loop and mode state live on Arduino. Jetson is a vision sensor that reports events over USB serial.
 2. **Default mode = patrol loop.** Everything else is entered on event, run for a bounded time, then returns to patrol.
-3. Existing hardware pin assignments in `hazard_monitor/hazard_monitor.ino` and `Servo_test/Servo_test.ino` are fixed — reuse them.
+3. Existing hardware pin assignments in `hazard_monitor/hazard_monitor.ino` and `archive/reference_only/Servo_test/Servo_test.ino` are fixed — reuse them.
 4. Source code, comments, and UI strings are English only.
 
 ---
@@ -167,7 +167,7 @@ Save once per track transition — not per frame. Hook into `detect_people.py` w
 ## 8. Development Phases
 
 ### Phase 1 — Motor control ✅ DONE
-Implemented in `wall_bounce/wall_bounce.ino`.
+Implemented in `archive/reference_only/wall_bounce/wall_bounce.ino`.
 - 4-motor differential drive (M1–M4) with PWM, per-motor sign correction, scaling ratios, and trim.
 - Functions: `driveForward`, `driveBackward`, `rotateLeft`, `rotateRight`, `stopMotors`.
 - Tuned values: `PWM_FORWARD=42`, `TURN_RIGHT_90_MS=2550`, `TURN_LEFT_90_MS=2400`.
@@ -175,7 +175,7 @@ Implemented in `wall_bounce/wall_bounce.ino`.
 - ⚠️ Merge into main firmware (Phase 4) — currently standalone file.
 
 ### Phase 2 — Patrol loop ✅ DONE
-Implemented in `wall_bounce/wall_bounce.ino`.
+Implemented in `archive/reference_only/wall_bounce/wall_bounce.ino`.
 - Wall-bounce navigation: drive forward → front ultrasonic poll (`FRONT_WALL_STOP_CM=25`) → stop → optional backup if < 12 cm → rotate 90° right → repeat.
 - Non-blocking per loop tick via `delay(LOOP_DELAY_MS=30)`.
 - U1 echo pin confirmed D32 — corrected in `wall_bounce.ino`.

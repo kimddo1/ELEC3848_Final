@@ -22,7 +22,7 @@ Demo fallback (no phone/Linux)
 ------------------------------
 btSend() on Arduino mirrors every BT message to USB serial as:
     [BT->] {"type":"fire",...}
-So test_serial.py on the Mac will show the alert data in its output.
+So archive/reference_only/test_serial.py on the Mac will show the alert data in its output.
 """
 
 import socket

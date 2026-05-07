@@ -21,7 +21,6 @@ yolo11_jetson/
   face_id.py             # face detection + recognition module
   enroll.py              # offline enrollment script
   capture_enroll.py      # interactive photo capture for enrollment
-  test_face_detect.py    # standalone face detection test (no recognition)
   yolo11n.engine         # YOLO11n TRT engine (person detection)
   face_det.engine        # SCRFD TRT engine (active — face detector)
   face_embed.engine      # MobileFaceNet TRT engine (face embedding, GPU)
@@ -33,6 +32,10 @@ yolo11_jetson/
   enrollments/
     <person_name>/
       01.jpg ... 05.jpg
+
+archive/
+  reference_only/
+    test_face_detect.py  # archived standalone face detection test (no recognition)
 ```
 
 ---
@@ -220,7 +223,7 @@ FACE_ID_EVERY_N_FRAMES = 8   # face ID runs ~4x/sec at 30fps
 SIM_THRESH      = 0.45       # cosine similarity threshold for match
 NO_FACE_TIMEOUT = 2.0        # seconds before alert status
 
-# test_face_detect.py
+# archive/reference_only/test_face_detect.py
 FACE_REGION_TOP      = 0.0   # search from top of person box
 FACE_REGION_BOTTOM   = 0.40  # search upper 40% only (head region)
 FACE_DETECT_INTERVAL = 1.0   # run face detection once per second
@@ -259,5 +262,4 @@ Replaced SSD ResNet-10 (CPU) with SCRFD TRT (GPU) as the face detector.
 Both detection and embedding now run fully on GPU — frame drops eliminated.
 
 ### Remaining Task
-
 

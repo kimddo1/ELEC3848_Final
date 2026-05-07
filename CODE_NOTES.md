@@ -13,16 +13,17 @@ See SESSION_NOTES.md for environment, errors, pipeline architecture, and enrollm
 | `face_id.py` | Face detection + recognition module | Active |
 | `enroll.py` | Offline face database builder | Active |
 | `capture_enroll.py` | Interactive camera capture for enrollment photos | Active |
-| `test_face_detect.py` | Standalone YOLO + SSD face detection test (no recognition) | Retired / reference only |
+| `archive/reference_only/test_face_detect.py` | Standalone YOLO + SSD face detection test (no recognition) | Archived / reference only |
+| `archive/reference_only/test_serial.py` | Mac-side serial tester for manual Arduino protocol checks | Archived / manual test |
 | `hazard_monitor/hazard_monitor.ino` | Arduino firmware — LED, servo, buzzer, ultrasonic, OLED display | Active |
-| `Servo_test/Servo_test.ino` | Standalone servo test — smooth 90↔130° sweep via serial command | Reference |
-| `wall_bounce/wall_bounce.ino` | 4-motor drive + wall-bounce navigation (front ultrasonic) | Active |
+| `archive/reference_only/Servo_test/Servo_test.ino` | Standalone servo test — smooth 90↔130° sweep via serial command | Archived reference |
+| `archive/reference_only/wall_bounce/wall_bounce.ino` | 4-motor drive + wall-bounce navigation (front ultrasonic) | Archived reference |
 | `arduino_link.py` | Jetson-side USB serial bridge to Arduino Mega | Active |
 | `audio_player.py` | Non-blocking aplay wrapper + TTS fallback for verified_<name> | Active |
 | `snapshot_writer.py` | Saves JPEG frame crops + CSV event log at each track transition | Active |
 | `generate_audio.py` | Generates all required WAV clips via espeak+sox (run once on Jetson) | Run once |
 | `bt_receiver.py` | Remote laptop script — reads HC-05 BT serial, prints formatted alerts | Run on laptop |
-| `web_dashboard.py` | Standard-library HTTP dashboard copied from Phase2 — live MJPEG, snapshots, events, remote controls | Active |
+| `web_dashboard.py` | Standard-library HTTP dashboard copied from the archived Phase2 snapshot — live MJPEG, snapshots, events, remote controls | Active |
 
 ---
 
@@ -178,11 +179,11 @@ NO_FACE_TIMEOUT   = 2.0
 
 ---
 
-## test_face_detect.py
+## archive/reference_only/test_face_detect.py
 
 **Role:** Standalone test script. YOLO person detection + SSD face detection inside person box. No recognition, no embeddings. Used to verify face detection before wiring up the full pipeline.
 
-**Status:** Retired — SCRFD is now used in production. This file still uses SSD and is kept for reference only.
+**Status:** Archived — SCRFD is now used in production. This file still uses SSD and is kept for reference only.
 
 **Key config:**
 ```python
@@ -198,6 +199,35 @@ SSD_CONF_THRESH      = 0.5
 - Draws blue boxes (person), green boxes (face), FPS/count overlay
 
 ---
+
+## archive/reference_only/test_serial.py
+
+**Role:** Mac-side serial tester for the Arduino Mega. It simulates the old Phase 3 Jetson events and exposes single-character hardware test commands so the USB serial protocol can be checked without running the Jetson vision stack.
+
+**Status:** Archived manual test utility — kept for bench debugging and BT fallback checks.
+
+**Key commands:**
+```python
+COMMANDS = {
+    "pd": "PERSON_DETECTED",
+    "fv": "FACE_VERIFIED:TestUser",
+    "fu": "FACE_UNKNOWN",
+    "ft": "FACE_TIMEOUT",
+    "hb": "HEARTBEAT",
+    "h":  "h",
+    "o":  "o",
+    "p":  "p",
+    "b":  "b",
+    "l":  "l",
+    "v":  "v",
+    "c":  "c",
+}
+```
+
+**Important details:**
+- Auto-detects likely macOS Arduino ports via `/dev/cu.usbmodem*` and `/dev/cu.usbserial*`
+- Starts a background reader thread so inbound Arduino lines remain visible while typing commands
+- Useful as a fallback observer for mirrored BT alerts (`[BT->] ...`) when testing without a phone or Linux BT host
 
 ---
 
@@ -289,11 +319,11 @@ LED_BRIGHTNESS        = 96
 
 ---
 
-## Servo_test/Servo_test.ino
+## archive/reference_only/Servo_test/Servo_test.ino
 
 **Role:** Standalone Arduino test sketch. Smooth servo movement between 90° (down) and 130° (up) triggered by serial commands `u` / `d`. Used to verify SG90 wiring and movement range independently of the main hazard monitor firmware.
 
-**Status:** Reference / test only — not part of the production pipeline.
+**Status:** Archived reference / test only — not part of the production pipeline.
 
 **Key config:**
 ```cpp
@@ -323,11 +353,11 @@ DOWN_DELAY_MS = 40   // ms per degree going down (faster return)
 
 ---
 
-## wall_bounce/wall_bounce.ino
+## archive/reference_only/wall_bounce/wall_bounce.ino
 
-**Role:** Standalone Arduino Mega sketch implementing basic motor control and wall-bounce navigation. Phase 1 (motors) and Phase 2 (patrol loop) reference implementation — logic will be merged into main firmware in Phase 4.
+**Role:** Standalone Arduino Mega sketch implementing basic motor control and wall-bounce navigation. It is the Phase 1/2 reference implementation that was later merged into `hazard_monitor/hazard_monitor.ino`.
 
-**Status:** Active / standalone. Not yet merged with `hazard_monitor.ino`.
+**Status:** Archived reference. Keep for tuning history and standalone bench tests.
 
 **Motor pins (4-motor differential drive):**
 
@@ -481,7 +511,7 @@ HEARTBEAT_INTERVAL_S = 2.0
 
 ## web_dashboard.py
 
-**Role:** Standard-library HTTP dashboard copied from `PatrolPro_Phase2/web_dashboard.py`. Runs on the Jetson side and exposes live video, saved snapshots, event logs, and remote control endpoints without requiring Flask. It is now started by `detect_people.py` during the main runtime.
+**Role:** Standard-library HTTP dashboard copied from `archive/copied_repo/PatrolPro_Phase2/web_dashboard.py`. Runs on the Jetson side and exposes live video, saved snapshots, event logs, and remote control endpoints without requiring Flask. It is now started by `detect_people.py` during the main runtime.
 
 **Key classes / functions:**
 
@@ -556,12 +586,13 @@ DEFAULT_STREAM_WIDTH = 960
 |---|---|
 | Session 1 | Created — interactive photo capture, auto/manual modes, GStreamer pipeline |
 
-### test_face_detect.py
+### archive/reference_only/test_face_detect.py
 | When | Change |
 |---|---|
 | Session 1 | Created — YOLO + Haar test |
 | Session 1 | Replaced Haar with SSD ResNet-10 |
 | Session 1 | Added upper-40% crop + 1-second time-based throttle to reduce lag |
+| Session 7 | Moved from repo root to `archive/reference_only/` to keep the old SSD-only experiment out of the main workspace. |
 
 ### SESSION_NOTES.md
 | When | Change |
@@ -572,6 +603,7 @@ DEFAULT_STREAM_WIDTH = 960
 | Session 2 | Added `Failed to create CaptureSession` / `nvargus-daemon` error entry |
 | Session 2 | Updated segfault fix — two-part fix (detector + encoder close) |
 | Session 2 | Updated "Where Things Were Left Off" — frame drop resolved, SCRFD confirmed working |
+| Session 7 | Updated file-structure and config references after archiving `test_face_detect.py` under `archive/reference_only/`. |
 
 ### hazard_monitor/hazard_monitor.ino
 | When | Change |
@@ -581,10 +613,16 @@ DEFAULT_STREAM_WIDTH = 960
 | Session 3 | **Phase 3:** Replaced single-char `handleSerial()` with line-buffered version. Added `dispatchSingleChar()` (preserves h/o/p/b/l/v/c), `dispatchJetsonLine()` (parses `PERSON_DETECTED`, `FACE_VERIFIED:<name>`, `FACE_UNKNOWN`, `FACE_TIMEOUT`, `HEARTBEAT`). Added forward declarations for both. |
 | Session 3 | **Phase 4:** Merged motor control from `wall_bounce.ino` (motor pins, drive functions, tuned ratios). Added `RobotMode` enum, `PatrolSubState` enum, `MotorPins` struct. Added mode globals. Added `enterPatrol/FireAlert/Verification/SecurityAlert()`, `runPatrol/FireAlert/Verification/SecurityAlert()`, `runCurrentMode()`. Added `drawVerificationOled()`, `drawSecurityAlertOled()`. Filled in `dispatchJetsonLine()` stubs. Updated `setup()` (adds `setupMotorPins`, `enterPatrol`). Updated `loop()` to call `updateHazardState` + `runCurrentMode` instead of `updateAlertOutputs`. Fire: 2200 Hz buzzer. Security: 3500 Hz buzzer. |
 
-### wall_bounce/wall_bounce.ino
+### archive/reference_only/test_serial.py
+| When | Change |
+|---|---|
+| Session 7 | Documented and moved from repo root to `archive/reference_only/` as a manual serial/BT fallback test utility. |
+
+### archive/reference_only/wall_bounce/wall_bounce.ino
 | When | Change |
 |---|---|
 | Session 3 | Created. 4-motor differential drive + wall-bounce navigation. Phase 1 (motors) and Phase 2 (patrol) implementation. Standalone file — merge into main firmware in Phase 4. |
+| Session 7 | Moved from repo root to `archive/reference_only/` after the patrol logic was integrated into `hazard_monitor/hazard_monitor.ino`. |
 
 ### arduino_link.py
 | When | Change |
@@ -628,11 +666,12 @@ DEFAULT_STREAM_WIDTH = 960
 | When | Change |
 |---|---|
 | Session 3 | **Phase 8:** Created. Connects to HC-05 paired BT port, reads JSON alert lines, pretty-prints with local timestamp. Auto-reconnects on disconnect. Set `BT_PORT` before running. |
+| Session 7 | Updated the demo-fallback note to point to `archive/reference_only/test_serial.py` after the manual serial tester was archived. |
 
 ### web_dashboard.py
 | When | Change |
 |---|---|
-| Session 5 | Copied unchanged from `PatrolPro_Phase2/web_dashboard.py`. Adds standard-library dashboard server with live MJPEG stream, snapshot/event APIs, and remote control POST endpoints. |
+| Session 5 | Copied unchanged from `archive/copied_repo/PatrolPro_Phase2/web_dashboard.py`. Adds standard-library dashboard server with live MJPEG stream, snapshot/event APIs, and remote control POST endpoints. |
 | Session 6 | Connected to `detect_people.py` runtime. The dashboard now receives live frames and status updates from the main Jetson loop, and its control endpoints are backed by Arduino serial commands through `ArduinoLink`. |
 
 ### audio/generate_clips.sh
@@ -640,16 +679,18 @@ DEFAULT_STREAM_WIDTH = 960
 |---|---|
 | Session 3 | Created. Generates `alert_fire.wav`, `alert_intruder.wav`, `detected_person.wav`, `approach_camera.wav`, `verified.wav` using pico2wave or espeak. Run once on Jetson. |
 
-### Servo_test/Servo_test.ino
+### archive/reference_only/Servo_test/Servo_test.ino
 | When | Change |
 |---|---|
 | Session 3 | Added to CODE_NOTES.md. Standalone servo test sketch — smooth 90° ↔ 130° sweep via `u`/`d` serial commands on D39. Reference only. |
+| Session 7 | Moved from repo root to `archive/reference_only/` so the standalone servo sketch stays available without cluttering the main workspace. |
 
 ### CODE_NOTES.md
 | When | Change |
 |---|---|
 | Session 2 | Created |
-| Session 3 | Added `Servo_test/Servo_test.ino` to file index and full detail section. Expanded `hazard_monitor/hazard_monitor.ino` section with full pin table, all functions, serial commands, config values, and alert behaviour. |
-| Session 3 | Added `wall_bounce/wall_bounce.ino` and `arduino_link.py` — file index entries, full detail sections, edit history rows. |
+| Session 3 | Added the standalone servo reference sketch to the file index and full detail section. Expanded `hazard_monitor/hazard_monitor.ino` section with full pin table, all functions, serial commands, config values, and alert behaviour. |
+| Session 3 | Added the standalone wall-bounce reference sketch and `arduino_link.py` — file index entries, full detail sections, edit history rows. |
 | Session 5 | Added `web_dashboard.py` file index/detail section and documented STOP_AUDIO, fire snapshot handling, Arduino mode additions, and dashboard copy. |
 | Session 6 | Updated notes to reflect live dashboard integration from `detect_people.py`, including runtime metrics and web-to-Arduino control mapping. |
+| Session 7 | Reindexed archived reference files under `archive/reference_only/`, documented `archive/reference_only/test_serial.py`, and updated the Phase 2 dashboard source path to `archive/copied_repo/PatrolPro_Phase2/web_dashboard.py`. |
