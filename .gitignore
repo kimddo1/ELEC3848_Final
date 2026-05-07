@@ -1,4 +1,26 @@
+# Local environment and tool state
 .env
-*.png
+.env.*
+!.env.example
+.claude/
+.venv/
+venv/
+
+# OS and Python noise
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated model and runtime data
+*.engine
+face_db.pkl
+enrollments/
+logs/
+snapshots/
+
+# Generated audio assets
+audio/*.wav
+
+# Archived / reference-only material
 archive/copied_repo/
-*.wav
+archive/reference_only/tag16_05_00000.png

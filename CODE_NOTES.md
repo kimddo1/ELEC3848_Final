@@ -24,6 +24,26 @@ See SESSION_NOTES.md for environment, errors, pipeline architecture, and enrollm
 | `generate_audio.py` | Generates all required WAV clips via espeak+sox (run once on Jetson) | Run once |
 | `bt_receiver.py` | Remote laptop script — reads HC-05 BT serial, prints formatted alerts | Run on laptop |
 | `web_dashboard.py` | Standard-library HTTP dashboard copied from the archived Phase2 snapshot — live MJPEG, snapshots, events, remote controls | Active |
+| `Required_Func/AMR_Final_V5_1.ino` | Required-function stage sketch — wall approach, ultrasonic perpendicular alignment, LDR scan, bounded strafe, and light centering | Active required-function sketch |
+| `Required_Func/ReqFun1_CODE_F5_C.ino` | Integrated required-function AMR sketch with OLED status, stage navigation, color handling, and parking logic | Active required-function sketch |
+| `Required_Func/AMR_Parking_AMR.ino` | Dedicated parking experiment using front/side ultrasonics, LDR entry assist, and green/red parking targets | Active required-function sketch |
+| `Required_Func/AMR_Live_Readings_Monitor.ino` | Live serial monitor for LDRs, front/side ultrasonics, and manual pan-servo positioning | Active test utility |
+| `Required_Func/AMR_Strafe_Angle_Test.ino` | Strafe + light-angle calibration sketch with wall approach and servo scan | Active test utility |
+| `Required_Func/AMR_Strafe_Time_Test.ino` | Strafe distance/time calibration sketch after wall approach and perpendicular alignment | Active test utility |
+| `Required_Func/AMR_Turn_90_Test.ino` | Timed 90-degree turn isolation sketch using current AMR motor tuning | Active test utility |
+| `Required_Func/Archive/AMR_Final_V1.ino` | Archived stage sketch revision for wall approach, LDR scan, and light centering | Archived required-function reference |
+| `Required_Func/Archive/AMR_Final_V2.ino` | Archived stage sketch revision for wall approach, LDR scan, and light centering | Archived required-function reference |
+| `Required_Func/Archive/AMR_Final_V3.ino` | Archived stage sketch revision using 45 cm first wall detection and light centering | Archived required-function reference |
+| `Required_Func/Archive/AMR_Final_V4.ino` | Archived stage sketch revision using 45 cm first wall detection and light centering | Archived required-function reference |
+| `Required_Func/Archive/AMR_Final_Light_Align.ino` | Archived light-alignment revision using 33 cm wall distance target | Archived required-function reference |
+| `Required_Func/Archive/AMR_Second_Stage.ino` | Archived second-stage sketch with color sensor branch, light centering, and stage movement | Archived required-function reference |
+| `Required_Func/Archive/AMR_Parking_Green_Red.ino` | Archived parking sketch branching on green/red floor target before ultrasonic parking | Archived parking reference |
+| `Required_Func/Archive/AMR_LDR_Calibration.ino` | LDR calibration utility for dark and front-profile sensor scaling | Archived test utility |
+| `Required_Func/Archive/AMR_Light_Center_Scan.ino` | Servo + LDR scan utility that locks onto the brightest light angle | Archived test utility |
+| `Required_Func/Archive/AMR_Motor_Trim_Test.ino` | Motor trim and ultrasonic/OLED test sketch for initial forward drift tuning | Archived test utility |
+| `Required_Func/Archive/AMR_Parallel_Min_PWM_Test.ino` | Sideways strafe minimum-PWM finder for left/right parallel movement | Archived test utility |
+| `Required_Func/Archive/AMR_Stage1_Front_LED.ino` | Stage-1-only sketch for homing toward the first far-wall LED | Archived test utility |
+| `Required_Func/Archive/test_sonic.ino` | Simple standalone ultrasonic sensor test sketch | Archived test utility |
 
 ---
 
@@ -542,6 +562,42 @@ DEFAULT_JPEG_QUALITY = 82
 DEFAULT_STREAM_FPS   = 8.0
 DEFAULT_STREAM_WIDTH = 960
 ```
+
+---
+
+## Required_Func Sketches
+
+**Role:** Arduino sketches for the separate required-function AMR work. These files were originally stored in same-name wrapper folders for Arduino IDE compatibility; they are now flattened so each `.ino` sits directly under `Required_Func/` or `Required_Func/Archive/`.
+
+**Active sketches:**
+
+| File | Purpose |
+|---|---|
+| `Required_Func/AMR_Final_V5_1.ino` | Current stage sketch for wall approach, perpendicular alignment, LDR scan, bounded strafe, and light centering. |
+| `Required_Func/ReqFun1_CODE_F5_C.ino` | Integrated required-function sketch with OLED status, stage navigation, color handling, and parking logic. |
+| `Required_Func/AMR_Parking_AMR.ino` | Dedicated parking experiment using front/side ultrasonics, LDR entry assist, and green/red parking targets. |
+| `Required_Func/AMR_Live_Readings_Monitor.ino` | Live readings utility for LDRs, front/side ultrasonics, and manual pan-servo control. |
+| `Required_Func/AMR_Strafe_Angle_Test.ino` | Strafe + light-angle calibration after wall approach and perpendicular alignment. |
+| `Required_Func/AMR_Strafe_Time_Test.ino` | Strafe distance/time calibration after wall approach and perpendicular alignment. |
+| `Required_Func/AMR_Turn_90_Test.ino` | Timed 90-degree turn isolation sketch for motor tuning. |
+
+**Archived sketches:**
+
+| File | Purpose |
+|---|---|
+| `Required_Func/Archive/AMR_Final_V1.ino` | Earlier stage sketch revision for wall approach, LDR scan, and light centering. |
+| `Required_Func/Archive/AMR_Final_V2.ino` | Earlier stage sketch revision for wall approach, LDR scan, and light centering. |
+| `Required_Func/Archive/AMR_Final_V3.ino` | Earlier stage sketch revision with 45 cm first wall detection. |
+| `Required_Func/Archive/AMR_Final_V4.ino` | Earlier stage sketch revision with 45 cm first wall detection. |
+| `Required_Func/Archive/AMR_Final_Light_Align.ino` | Light-alignment revision using a 33 cm wall-distance target. |
+| `Required_Func/Archive/AMR_Second_Stage.ino` | Second-stage sketch with color sensor branch, light centering, and stage movement. |
+| `Required_Func/Archive/AMR_Parking_Green_Red.ino` | Parking sketch that branches on green/red floor target before ultrasonic parking. |
+| `Required_Func/Archive/AMR_LDR_Calibration.ino` | LDR dark/front-profile calibration utility. |
+| `Required_Func/Archive/AMR_Light_Center_Scan.ino` | Servo + LDR scan utility that locks onto the brightest light angle. |
+| `Required_Func/Archive/AMR_Motor_Trim_Test.ino` | Motor trim and ultrasonic/OLED test sketch for initial forward drift tuning. |
+| `Required_Func/Archive/AMR_Parallel_Min_PWM_Test.ino` | Sideways strafe minimum-PWM finder for left/right movement. |
+| `Required_Func/Archive/AMR_Stage1_Front_LED.ino` | Stage-1-only sketch for homing toward the first far-wall LED. |
+| `Required_Func/Archive/test_sonic.ino` | Simple standalone ultrasonic sensor test. |
 
 ---
 
